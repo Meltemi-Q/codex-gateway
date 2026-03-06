@@ -19,7 +19,29 @@ The API is OpenAI-compatible — any client that works with the OpenAI SDK will 
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated (`codex login`)
 - A working directory that Codex trusts (listed in `~/.codex/config.toml`)
 
-## Usage
+## Quick install (recommended)
+
+Clone the repo and run the setup wizard — it detects your environment, asks a few questions, and installs a system service automatically.
+
+```bash
+git clone https://github.com/Meltemi-Q/codex-gateway.git
+cd codex-gateway
+bash setup.sh
+```
+
+The wizard will:
+- Detect your Node.js and codex binary paths automatically
+- Ask for port (default `8319`), working directory, and optional proxy
+- Install a **launchd** service on macOS (auto-starts on login)
+- Install a **systemd** service on Linux (auto-starts on boot)
+
+After setup, test with:
+
+```bash
+curl http://127.0.0.1:8319/v1/models
+```
+
+## Manual usage
 
 ```bash
 # Start with defaults (port 8319, auto-detect codex binary)
@@ -38,6 +60,9 @@ PORT=8400 CODEX_PATH=/usr/local/bin/codex node index.mjs
 | `CODEX_HOME` | `~/.codex` | Codex data directory (contains auth and model cache) |
 | `WORK_DIR` | `process.cwd()` | Working directory passed to `codex exec` |
 | `HTTPS_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
+| `HTTP_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
+| `ALL_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
+| `NO_PROXY` | — | Proxy bypass list |
 
 ### Example request
 
@@ -50,67 +75,45 @@ curl http://127.0.0.1:8319/v1/chat/completions \
   }'
 ```
 
+### Use with any OpenAI-compatible client
+
+Point your client's base URL to `http://127.0.0.1:8319` and use any API key (not validated):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8319/v1", api_key="any")
+response = client.chat.completions.create(
+    model="gpt-5.4",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+print(response.choices[0].message.content)
+```
+
 ### Use with cliproxyapi
 
-Add codex-gateway as an `openai-compatibility` provider in `~/.cli-proxy-api/config.yaml` to make all its models available through cliproxyapi's unified endpoint:
+Add codex-gateway as an `openai-compatibility` provider in `~/.cli-proxy-api/config.yaml`:
 
 ```yaml
 openai-compatibility:
   - name: "codex-gateway"
     base-url: "http://127.0.0.1:8319"
     api-key-entries:
-      - api-key: "any-key"   # codex-gateway does not validate keys
+      - api-key: "any-key"
     models:
       - name: "gpt-5.4"
         alias: "gpt-5.4"
-      # add more models as needed — or query /v1/models for the live list
-```
-
-### Run as a macOS service (launchd)
-
-Create `~/Library/LaunchAgents/com.codex-gateway.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.codex-gateway</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/node</string>
-        <string>/path/to/codex-gateway/index.mjs</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>WORK_DIR</key>
-        <string>/your/trusted/directory</string>
-        <key>HTTPS_PROXY</key>
-        <string>http://127.0.0.1:7890</string>
-        <key>HTTP_PROXY</key>
-        <string>http://127.0.0.1:7890</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/codex-gateway.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/codex-gateway.log</string>
-</dict>
-</plist>
-```
-
-```bash
-launchctl load ~/Library/LaunchAgents/com.codex-gateway.plist
 ```
 
 ## How model auto-discovery works
 
 The Codex CLI caches the upstream model list at `~/.codex/models_cache.json` after each run. codex-gateway watches this file with `fs.watch` and reloads the model list whenever it changes — no restart needed. If the file is unavailable, a built-in fallback list is used.
+
+New models released by OpenAI appear automatically the next time the Codex CLI runs.
+
+## Authentication
+
+codex-gateway uses the credentials stored by `codex login` (`~/.codex/auth.json`). Tokens are valid for 10 days and auto-refresh. Run `codex login` again if you see auth errors.
 
 ## License
 
