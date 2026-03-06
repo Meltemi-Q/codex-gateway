@@ -14,17 +14,30 @@ bold() { printf '\033[1m%s\033[0m' "$*"; }
 green() { printf '\033[32m%s\033[0m' "$*"; }
 yellow() { printf '\033[33m%s\033[0m' "$*"; }
 red() { printf '\033[31m%s\033[0m' "$*"; }
+HAS_TTY=true
+{ true </dev/tty; } 2>/dev/null || HAS_TTY=false
+
 ask() {
   local prompt="$1" default="$2" var="$3"
-  printf '%s [%s]: ' "$(bold "$prompt")" "$default"
-  read -r input
-  eval "$var=\"\${input:-$default}\""
+  if $HAS_TTY; then
+    printf '%s [%s]: ' "$(bold "$prompt")" "$default"
+    read -r input </dev/tty
+    eval "$var=\"\${input:-$default}\""
+  else
+    eval "$var=\"$default\""
+    printf '%s: %s (default)\n' "$(bold "$prompt")" "$default"
+  fi
 }
 ask_optional() {
   local prompt="$1" var="$2"
-  printf '%s (leave blank to skip): ' "$(bold "$prompt")"
-  read -r input
-  eval "$var=\"$input\""
+  if $HAS_TTY; then
+    printf '%s (leave blank to skip): ' "$(bold "$prompt")"
+    read -r input </dev/tty
+    eval "$var=\"$input\""
+  else
+    eval "$var=\"\""
+    printf '%s: (skipped — no TTY)\n' "$(bold "$prompt")"
+  fi
 }
 
 echo
