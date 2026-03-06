@@ -126,14 +126,20 @@ $lines += "`"$NodePath`" `"$Script`" >> `"$LogFile`" 2>&1"
 $WrapperBat = Join-Path $env:APPDATA "codex-gateway\run.bat"
 Set-Content -Path $WrapperBat -Value ($lines -join "`r`n") -Encoding ASCII
 
+# VBScript launcher — runs the bat silently with no visible window
+$WrapperVbs = Join-Path $env:APPDATA "codex-gateway\run.vbs"
+$vbsContent  = "CreateObject(`"WScript.Shell`").Run `"`"`"$WrapperBat`"`"`", 0, False"
+Set-Content -Path $WrapperVbs -Value $vbsContent -Encoding ASCII
+
 # ── register Task Scheduler job ───────────────────────────────────────────────
 
 # Remove old task if it exists (ignore error if not found)
 try { $null = schtasks /delete /tn $TaskName /f 2>&1 } catch {}
 
-# Create: trigger = ONLOGON, run as current user, start immediately
+# Create: trigger = ONLOGON, run wscript (no window) as current user
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$null = schtasks /create /tn $TaskName /tr "`"$WrapperBat`"" /sc ONLOGON /ru $CurrentUser /rl HIGHEST /f 2>&1
+$TrCommand   = "wscript.exe `"$WrapperVbs`""
+$null = schtasks /create /tn $TaskName /tr $TrCommand /sc ONLOGON /ru $CurrentUser /rl HIGHEST /f 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Err "Failed to create Task Scheduler job. Try running as Administrator."
     exit 1
