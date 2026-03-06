@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # codex-gateway setup script
 # Installs codex-gateway as a system service (macOS launchd or Linux systemd).
-# Usage: bash setup.sh [--port PORT] [--work-dir DIR] [--proxy URL]
+# Usage: bash setup.sh
 
 set -e
 
@@ -77,8 +77,17 @@ if [[ -z "$CODEX_DEFAULT" ]]; then
   CODEX_DEFAULT="$(command -v codex 2>/dev/null || true)"
 fi
 if [[ -z "$CODEX_DEFAULT" ]]; then
-  echo "  $(yellow 'Warning:') codex binary not found — you can still set CODEX_PATH later."
-  CODEX_DEFAULT="codex"
+  echo
+  echo "  $(red 'Error:') Codex CLI not found."
+  echo
+  echo "  Install it with:"
+  echo "    npm install -g @openai/codex"
+  echo
+  echo "  Then log in:"
+  echo "    codex login"
+  echo
+  echo "  Re-run this setup script after installation."
+  exit 1
 fi
 echo "  Codex:    $(green "$CODEX_DEFAULT")"
 
@@ -87,9 +96,26 @@ echo "  Codex:    $(green "$CODEX_DEFAULT")"
 CODEX_HOME_DEFAULT="$HOME/.codex"
 AUTH_FILE="$CODEX_HOME_DEFAULT/auth.json"
 if [[ -f "$AUTH_FILE" ]]; then
-  echo "  Auth:     $(green "found ($AUTH_FILE)")"
+  echo "  Auth:     $(green "logged in ($AUTH_FILE)")"
 else
-  echo "  Auth:     $(yellow "not found — run 'codex login' after setup")"
+  echo
+  echo "  $(yellow 'Warning:') Codex CLI is not logged in yet."
+  echo
+  echo "  Please run:"
+  echo "    codex login"
+  echo
+  echo "  Then re-run this setup script."
+  echo
+  if $HAS_TTY; then
+    printf "  Continue anyway? [y/N]: "
+    read -r confirm </dev/tty
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      echo "  Aborted."
+      exit 1
+    fi
+  else
+    echo "  $(yellow 'Continuing with defaults (no TTY)...')"
+  fi
 fi
 
 echo
