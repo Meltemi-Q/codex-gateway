@@ -1,0 +1,19 @@
+{
+  "name": "codex-gateway",
+  "version": "1.0.0",
+  "description": "A zero-dependency OpenAI-compatible HTTP gateway for the Codex CLI. Auto-discovers models from ~/.codex/models_cache.json.",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "codex-gateway": "index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "keywords": ["openai", "codex", "proxy", "gateway", "openai-compatible", "cli"],
+  "author": "Meltemi-Q",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
