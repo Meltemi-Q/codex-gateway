@@ -154,12 +154,13 @@ async function runCodex(model, prompt) {
       NODE_PATH,
       [
         CODEX_PATH,
-        "-a", "never",           // never ask for approval
-        "-s", "workspace-write", // minimal sandbox
+        "-a", "never",              // never ask for approval
+        "-s", "workspace-write",    // minimal sandbox
         "exec",
+        "--skip-git-repo-check",    // allow non-git work dirs (needed on Linux servers)
         "--model", model,
         "--output-last-message", tmpFile,
-        "-",                     // read prompt from stdin
+        "-",                        // read prompt from stdin
       ],
       { cwd: WORK_DIR, env: buildSpawnEnv(), stdio: ["pipe", "pipe", "pipe"] }
     );
