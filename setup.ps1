@@ -101,22 +101,30 @@ Write-Host ""
 # ── build the command that Task Scheduler will run ────────────────────────────
 
 # Env vars are passed via a wrapper cmd that sets them before launching node
-$EnvBlock = "set PORT=$PORT && set WORK_DIR=$WORK_DIR && set CODEX_HOME=$CodexHome"
-if ($HTTPS_PROXY_VAL) {
-    $HTTP_PROXY_VAL  = $HTTPS_PROXY_VAL
-    $ALL_PROXY_VAL   = $HTTPS_PROXY_VAL -replace "^http", "socks5"
-    $EnvBlock += " && set HTTPS_PROXY=$HTTPS_PROXY_VAL && set HTTP_PROXY=$HTTP_PROXY_VAL && set ALL_PROXY=$ALL_PROXY_VAL && set NO_PROXY=localhost,127.0.0.1,::1"
-}
-$EnvBlock += " && set CODEX_PATH=$CodexPath"
-
 $LogDir  = Join-Path $env:APPDATA "codex-gateway\logs"
 $LogFile = Join-Path $LogDir "codex-gateway.log"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
-# A tiny wrapper bat that sets env and launches node, redirecting output
+# Build wrapper bat — each `set` on its own line to avoid trailing-space bug
+$lines = @(
+    "@echo off",
+    "set PORT=$PORT",
+    "set WORK_DIR=$WORK_DIR",
+    "set CODEX_HOME=$CodexHome",
+    "set CODEX_PATH=$CodexPath"
+)
+if ($HTTPS_PROXY_VAL) {
+    $HTTP_PROXY_VAL = $HTTPS_PROXY_VAL
+    $ALL_PROXY_VAL  = $HTTPS_PROXY_VAL -replace "^http", "socks5"
+    $lines += "set HTTPS_PROXY=$HTTPS_PROXY_VAL"
+    $lines += "set HTTP_PROXY=$HTTP_PROXY_VAL"
+    $lines += "set ALL_PROXY=$ALL_PROXY_VAL"
+    $lines += "set NO_PROXY=localhost,127.0.0.1,::1"
+}
+$lines += "`"$NodePath`" `"$Script`" >> `"$LogFile`" 2>&1"
+
 $WrapperBat = Join-Path $env:APPDATA "codex-gateway\run.bat"
-$WrapperContent = "@echo off`r`n$EnvBlock && `"$NodePath`" `"$Script`" >> `"$LogFile`" 2>&1"
-Set-Content -Path $WrapperBat -Value $WrapperContent -Encoding ASCII
+Set-Content -Path $WrapperBat -Value ($lines -join "`r`n") -Encoding ASCII
 
 # ── register Task Scheduler job ───────────────────────────────────────────────
 
