@@ -161,6 +161,7 @@ The importer:
 - writes Droid entries with `provider: "generic-chat-completion-api"`
 - creates `config.json.bak` and `settings.json.bak` before overwriting
 - reads the live gateway `/v1/models` endpoint when available, then falls back to `~/.codex/models_cache.json`
+- skips without writing anything if Droid is not detected (`droid` not on PATH and `~/.factory` missing)
 
 ### Use with cliproxyapi
 

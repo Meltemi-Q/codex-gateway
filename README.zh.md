@@ -171,6 +171,7 @@ npm run sync:droid -- --base-url http://127.0.0.1:8400/v1
 - 使用 `provider: "generic-chat-completion-api"` 写入 Droid 模型
 - 在覆盖前自动生成 `config.json.bak` 和 `settings.json.bak`
 - 优先读取正在运行的网关 `/v1/models`，不可用时回退到 `~/.codex/models_cache.json`
+- 如果没检测到 Droid（PATH 里没有 `droid`，且 `~/.factory` 不存在），就直接跳过，不会写任何文件
 
 ### 配合 cliproxyapi 使用
 

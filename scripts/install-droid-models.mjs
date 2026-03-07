@@ -86,6 +86,37 @@ function normalizeBaseUrl(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
+function commandExists(command) {
+  const pathValue = process.env.PATH || "";
+  const pathEntries = pathValue.split(path.delimiter).filter(Boolean);
+  const extCandidates =
+    process.platform === "win32"
+      ? uniq((process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";").map((item) => item.toLowerCase()))
+      : [""];
+
+  for (const entry of pathEntries) {
+    if (process.platform === "win32") {
+      const lowerCommand = command.toLowerCase();
+      const hasExt = /\.[^\\/.]+$/.test(command);
+      const candidates = hasExt ? [command] : extCandidates.map((ext) => `${command}${ext}`);
+      for (const candidate of candidates) {
+        if (existsSync(path.join(entry, candidate))) return true;
+      }
+      if (hasExt && existsSync(path.join(entry, lowerCommand))) return true;
+    } else if (existsSync(path.join(entry, command))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isDroidDetected(factoryHome) {
+  const settingsFile = path.join(factoryHome, "settings.json");
+  const configFile = path.join(factoryHome, "config.json");
+  return existsSync(factoryHome) || existsSync(settingsFile) || existsSync(configFile) || commandExists("droid");
+}
+
 function stripJsonComments(source) {
   let result = "";
   let inString = false;
@@ -360,6 +391,11 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const configFile = path.join(options.factoryHome, "config.json");
   const settingsFile = path.join(options.factoryHome, "settings.json");
+
+  if (!isDroidDetected(options.factoryHome)) {
+    console.log(`[droid-sync] skipped: Droid not detected (no droid binary on PATH and ${options.factoryHome} not found)`);
+    return;
+  }
 
   const resolved = await resolveModels(options.baseUrl, options.codexHome);
   if (resolved.models.length === 0) {
