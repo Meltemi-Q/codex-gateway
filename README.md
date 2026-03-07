@@ -29,6 +29,21 @@ cd codex-gateway
 bash setup.sh
 ```
 
+If you want a real one-liner, use the bootstrap installer instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Meltemi-Q/codex-gateway/main/install.sh | \
+  bash -s -- --yes --sync-droid --set-default-droid
+```
+
+That command:
+- clones or updates `~/codex-gateway`
+- installs `codex-gateway` as a launchd/systemd service
+- imports the current model list into Droid
+- sets `GPT-5.4 [Codex Gateway]` as the default Droid session model
+
+No trailing `&` is needed. The installer registers a system service, so the gateway keeps running after the shell exits.
+
 The wizard will:
 - Detect your Node.js and codex binary paths automatically
 - Ask for port (default `8319`), working directory, and optional proxy
@@ -39,6 +54,12 @@ After setup, test with:
 
 ```bash
 curl http://127.0.0.1:8319/v1/models
+```
+
+For a non-interactive local install without the bootstrap helper:
+
+```bash
+bash setup.sh --yes --sync-droid --set-default-droid
 ```
 
 ## Manual usage

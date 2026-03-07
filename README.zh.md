@@ -40,16 +40,31 @@ cd codex-gateway
 bash setup.sh
 ```
 
-或者一键安装：
+如果你想直接一条命令装好并顺手把 Droid 也配上，可以用：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Meltemi-Q/codex-gateway/main/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Meltemi-Q/codex-gateway/main/install.sh | \
+  bash -s -- --yes --sync-droid --set-default-droid
 ```
+
+这条命令会：
+- 克隆或更新 `~/codex-gateway`
+- 安装 `codex-gateway` 到 launchd / systemd
+- 把当前模型列表导入 Droid
+- 把 `GPT-5.4 [Codex Gateway]` 设为 Droid 默认会话模型
+
+不需要额外加 `&`。安装完成后它就是系统服务，shell 退出后也会继续运行。
 
 向导会自动：
 - 检测 Node.js 和 codex 路径
 - 提示配置端口（默认 `8319`）、工作目录、代理地址
 - 注册 **launchd** 服务（macOS，登录后自动启动）或 **systemd** 服务（Linux，开机自动启动）
+
+如果你已经在本地仓库目录里，也可以直接无交互执行：
+
+```bash
+bash setup.sh --yes --sync-droid --set-default-droid
+```
 
 ### Windows
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # codex-gateway setup script
 # Installs codex-gateway as a system service (macOS launchd or Linux systemd).
-# Usage: bash setup.sh
+# Usage: bash setup.sh [options]
 
-set -e
+set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$REPO_DIR/index.mjs"
@@ -16,10 +16,99 @@ yellow() { printf '\033[33m%s\033[0m' "$*"; }
 red() { printf '\033[31m%s\033[0m' "$*"; }
 HAS_TTY=true
 { true </dev/tty; } 2>/dev/null || HAS_TTY=false
+FORCE_DEFAULTS=false
+SYNC_DROID=false
+SET_DEFAULT_DROID=false
+DROID_BACKUP=true
+PORT_OVERRIDE=""
+WORK_DIR_OVERRIDE=""
+HTTPS_PROXY_OVERRIDE=""
+DROID_BASE_URL_OVERRIDE=""
+DROID_API_KEY_OVERRIDE=""
+DROID_PROVIDER_OVERRIDE=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash setup.sh [options]
+
+Options:
+  --yes, --non-interactive    Use defaults / provided flags without prompts
+  --port <port>               Listening port (default: 8319)
+  --work-dir <path>           Working directory for codex (default: $HOME)
+  --https-proxy <url>         HTTPS proxy to pass to the gateway service
+  --sync-droid                Import codex-gateway models into Droid after setup
+  --set-default-droid         Also set GPT-5.4 [Codex Gateway] as Droid default
+  --droid-base-url <url>      Droid base URL override (default: http://127.0.0.1:<port>/v1)
+  --droid-api-key <key>       Droid API key value to write (default: sk-codex-gateway)
+  --droid-provider <name>     Droid provider value (default: generic-chat-completion-api)
+  --no-droid-backup           Skip .bak backups before writing Droid config
+  --help                      Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes|--non-interactive)
+      FORCE_DEFAULTS=true
+      shift
+      ;;
+    --port)
+      PORT_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --work-dir)
+      WORK_DIR_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --https-proxy)
+      HTTPS_PROXY_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --sync-droid)
+      SYNC_DROID=true
+      shift
+      ;;
+    --set-default-droid)
+      SYNC_DROID=true
+      SET_DEFAULT_DROID=true
+      shift
+      ;;
+    --droid-base-url)
+      DROID_BASE_URL_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --droid-api-key)
+      DROID_API_KEY_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --droid-provider)
+      DROID_PROVIDER_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --no-droid-backup)
+      DROID_BACKUP=false
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "$(red 'Unknown option:') $1"
+      echo
+      usage
+      exit 1
+      ;;
+  esac
+done
 
 ask() {
   local prompt="$1" default="$2" var="$3"
-  if $HAS_TTY; then
+  if $FORCE_DEFAULTS; then
+    eval "$var=\"$default\""
+    printf '%s: %s (configured)\n' "$(bold "$prompt")" "$default"
+  elif $HAS_TTY; then
     printf '%s [%s]: ' "$(bold "$prompt")" "$default"
     read -r input </dev/tty
     eval "$var=\"\${input:-$default}\""
@@ -29,13 +118,20 @@ ask() {
   fi
 }
 ask_optional() {
-  local prompt="$1" var="$2"
-  if $HAS_TTY; then
+  local prompt="$1" var="$2" default="${3:-}"
+  if $FORCE_DEFAULTS; then
+    eval "$var=\"$default\""
+    if [[ -n "$default" ]]; then
+      printf '%s: %s (configured)\n' "$(bold "$prompt")" "$default"
+    else
+      printf '%s: (skipped)\n' "$(bold "$prompt")"
+    fi
+  elif $HAS_TTY; then
     printf '%s (leave blank to skip): ' "$(bold "$prompt")"
     read -r input </dev/tty
     eval "$var=\"$input\""
   else
-    eval "$var=\"\""
+    eval "$var=\"$default\""
     printf '%s: (skipped — no TTY)\n' "$(bold "$prompt")"
   fi
 }
@@ -122,9 +218,13 @@ echo
 
 # ── interactive prompts ───────────────────────────────────────────────────────
 
-ask "Listening port" "8319" PORT
-ask "Working directory for codex" "$HOME" WORK_DIR
-ask_optional "HTTPS proxy (e.g. http://127.0.0.1:7890)" HTTPS_PROXY_VAL
+PORT_DEFAULT="${PORT_OVERRIDE:-8319}"
+WORK_DIR_DEFAULT="${WORK_DIR_OVERRIDE:-$HOME}"
+HTTPS_PROXY_DEFAULT="${HTTPS_PROXY_OVERRIDE:-}"
+
+ask "Listening port" "$PORT_DEFAULT" PORT
+ask "Working directory for codex" "$WORK_DIR_DEFAULT" WORK_DIR
+ask_optional "HTTPS proxy (e.g. http://127.0.0.1:7890)" HTTPS_PROXY_VAL "$HTTPS_PROXY_DEFAULT"
 
 echo
 
@@ -240,6 +340,27 @@ UNIT
   echo "  $(green 'Installed:') $UNIT_FILE"
   echo "  $(green 'Started') as systemd service (auto-start on boot)"
   echo "  Logs:   journalctl -u codex-gateway -f"
+fi
+
+if $SYNC_DROID; then
+  echo
+  echo "  $(bold 'Syncing Droid models...')"
+  DROID_BASE_URL="${DROID_BASE_URL_OVERRIDE:-http://127.0.0.1:${PORT}/v1}"
+  DROID_API_KEY="${DROID_API_KEY_OVERRIDE:-sk-codex-gateway}"
+  DROID_PROVIDER="${DROID_PROVIDER_OVERRIDE:-generic-chat-completion-api}"
+  DROID_ARGS=(
+    "--base-url" "$DROID_BASE_URL"
+    "--api-key" "$DROID_API_KEY"
+    "--provider" "$DROID_PROVIDER"
+  )
+  if $SET_DEFAULT_DROID; then
+    DROID_ARGS+=("--set-default")
+  fi
+  if ! $DROID_BACKUP; then
+    DROID_ARGS+=("--no-backup")
+  fi
+
+  "$NODE_PATH" "$REPO_DIR/scripts/install-droid-models.mjs" "${DROID_ARGS[@]}"
 fi
 
 # ── done ─────────────────────────────────────────────────────────────────────
