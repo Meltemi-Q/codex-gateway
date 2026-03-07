@@ -74,7 +74,25 @@ cd codex-gateway
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-向导会自动注册 **Task Scheduler** 任务（登录后自动启动）。
+如果你想在 Windows 上也一条命令装好并顺手同步 Droid，可以用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Meltemi-Q/codex-gateway/main/install.ps1))) -Yes -SyncDroid -SetDefaultDroid"
+```
+
+这条命令会：
+- 克隆或更新 `%USERPROFILE%\codex-gateway`
+- 把 `codex-gateway` 注册成 **Task Scheduler** 任务
+- 把当前模型列表导入 Droid
+- 把 `GPT-5.4 [Codex Gateway]` 设为 Droid 默认会话模型
+
+不需要额外加 `&`。安装完成后它是计划任务，shell 退出后也会继续运行。
+
+如果你已经在本地仓库目录里，也可以直接无交互执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1 -Yes -SyncDroid -SetDefaultDroid
+```
 
 ### 安装完成后验证
 

@@ -86,6 +86,110 @@ function normalizeBaseUrl(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
+function stripJsonComments(source) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+
+    if (inString) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      result += char;
+      continue;
+    }
+
+    if (char === "/" && next === "/") {
+      index += 2;
+      while (index < source.length && source[index] !== "\n") {
+        index += 1;
+      }
+      if (index < source.length) result += source[index];
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
+        index += 1;
+      }
+      index += 1;
+      continue;
+    }
+
+    result += char;
+  }
+
+  return result;
+}
+
+function stripTrailingCommas(source) {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+
+    if (inString) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      result += char;
+      continue;
+    }
+
+    if (char === ",") {
+      let lookahead = index + 1;
+      while (lookahead < source.length && /\s/.test(source[lookahead])) {
+        lookahead += 1;
+      }
+      if (source[lookahead] === "}" || source[lookahead] === "]") {
+        continue;
+      }
+    }
+
+    result += char;
+  }
+
+  return result;
+}
+
+function parseJsonFile(raw) {
+  const normalized = String(raw || "").replace(/^\uFEFF/, "");
+  try {
+    return JSON.parse(normalized);
+  } catch {}
+
+  const withoutComments = stripJsonComments(normalized);
+  const withoutTrailingCommas = stripTrailingCommas(withoutComments);
+  return JSON.parse(withoutTrailingCommas);
+}
+
 function uniq(items) {
   return [...new Set(items.filter(Boolean))];
 }
@@ -134,7 +238,7 @@ function idForDisplayName(displayName, index) {
 async function readJson(file, fallbackValue) {
   if (!existsSync(file)) return fallbackValue;
   const raw = await fs.readFile(file, "utf-8");
-  return JSON.parse(raw);
+  return parseJsonFile(raw);
 }
 
 async function backupFile(file, enabled) {

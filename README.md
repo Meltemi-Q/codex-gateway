@@ -62,6 +62,34 @@ For a non-interactive local install without the bootstrap helper:
 bash setup.sh --yes --sync-droid --set-default-droid
 ```
 
+### Windows
+
+```powershell
+git clone https://github.com/Meltemi-Q/codex-gateway.git
+cd codex-gateway
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+If you want the Windows one-line bootstrap installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Meltemi-Q/codex-gateway/main/install.ps1))) -Yes -SyncDroid -SetDefaultDroid"
+```
+
+That command:
+- clones or updates `%USERPROFILE%\codex-gateway`
+- installs `codex-gateway` as a Task Scheduler job
+- imports the current model list into Droid
+- sets `GPT-5.4 [Codex Gateway]` as the default Droid session model
+
+No trailing `&` is needed. The installer registers a scheduled task, so the gateway keeps running after the shell exits.
+
+For a non-interactive local install from an existing clone:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1 -Yes -SyncDroid -SetDefaultDroid
+```
+
 ## Manual usage
 
 ```bash

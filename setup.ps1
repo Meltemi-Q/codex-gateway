@@ -1,6 +1,20 @@
 # codex-gateway setup script for Windows
 # Installs codex-gateway as a Task Scheduler job (auto-starts on login).
-# Usage: powershell -ExecutionPolicy Bypass -File setup.ps1
+# Usage: powershell -ExecutionPolicy Bypass -File setup.ps1 [options]
+
+param(
+    [switch]$Yes,
+    [string]$Port,
+    [string]$WorkDir,
+    [string]$HttpsProxy,
+    [switch]$SyncDroid,
+    [switch]$SetDefaultDroid,
+    [string]$DroidBaseUrl,
+    [string]$DroidApiKey,
+    [string]$DroidProvider,
+    [switch]$NoDroidBackup,
+    [switch]$Help
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -13,6 +27,56 @@ function Write-Ok($msg)   { Write-Host "  $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  Warning: $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "  Error: $msg" -ForegroundColor Red }
 function Write-Sep  { Write-Host "  -------------------------------------" }
+function Show-Usage {
+    @"
+Usage:
+  powershell -ExecutionPolicy Bypass -File setup.ps1 [options]
+
+Options:
+  -Yes                    Use defaults / provided flags without prompts
+  -Port <port>            Listening port (default: 8319)
+  -WorkDir <path>         Working directory for codex (default: %USERPROFILE%)
+  -HttpsProxy <url>       HTTPS proxy to pass to the gateway service
+  -SyncDroid              Import codex-gateway models into Droid after setup
+  -SetDefaultDroid        Also set GPT-5.4 [Codex Gateway] as Droid default
+  -DroidBaseUrl <url>     Droid base URL override (default: http://127.0.0.1:<port>/v1)
+  -DroidApiKey <key>      Droid API key value to write (default: sk-codex-gateway)
+  -DroidProvider <name>   Droid provider value (default: generic-chat-completion-api)
+  -NoDroidBackup          Skip .bak backups before writing Droid config
+  -Help                   Show this help
+"@
+}
+function Read-Value([string]$Prompt, [string]$Default) {
+    if ($Yes) {
+        Write-Host ("  {0}: {1} (configured)" -f $Prompt, $Default) -ForegroundColor White
+        return $Default
+    }
+    $input = Read-Host ("  {0} [{1}]" -f $Prompt, $Default)
+    if ([string]::IsNullOrWhiteSpace($input)) {
+        return $Default
+    }
+    return $input
+}
+function Read-OptionalValue([string]$Prompt, [string]$Default = "") {
+    if ($Yes) {
+        if ([string]::IsNullOrWhiteSpace($Default)) {
+            Write-Host ("  {0}: (skipped)" -f $Prompt) -ForegroundColor White
+            return ""
+        }
+        Write-Host ("  {0}: {1} (configured)" -f $Prompt, $Default) -ForegroundColor White
+        return $Default
+    }
+    return Read-Host ("  {0} (leave blank to skip)" -f $Prompt)
+}
+
+if ($Help) {
+    Show-Usage
+    exit 0
+}
+
+if ($SetDefaultDroid) {
+    $SyncDroid = $true
+}
 
 Write-Host ""
 Write-Header
@@ -73,10 +137,14 @@ if (Test-Path $AuthFile) {
     Write-Host "  Please run:" -ForegroundColor White
     Write-Host "    codex login" -ForegroundColor Cyan
     Write-Host ""
-    $confirm = Read-Host "  Continue anyway? [y/N]"
-    if ($confirm -ne "y" -and $confirm -ne "Y") {
-        Write-Host "  Aborted."
-        exit 1
+    if ($Yes) {
+        Write-Warn "Continuing with defaults because -Yes was specified."
+    } else {
+        $confirm = Read-Host "  Continue anyway? [y/N]"
+        if ($confirm -ne "y" -and $confirm -ne "Y") {
+            Write-Host "  Aborted."
+            exit 1
+        }
     }
 }
 
@@ -84,17 +152,13 @@ Write-Host ""
 
 # ── interactive prompts ───────────────────────────────────────────────────────
 
-$defaultPort    = "8319"
-$defaultWorkDir = $env:USERPROFILE
-$defaultProxy   = ""
+$defaultPort    = if ($Port) { $Port } else { "8319" }
+$defaultWorkDir = if ($WorkDir) { $WorkDir } else { $env:USERPROFILE }
+$defaultProxy   = if ($HttpsProxy) { $HttpsProxy } else { "" }
 
-$portInput = Read-Host "  Listening port [$defaultPort]"
-$PORT      = if ($portInput) { $portInput } else { $defaultPort }
-
-$wdInput  = Read-Host "  Working directory for codex [$defaultWorkDir]"
-$WORK_DIR = if ($wdInput) { $wdInput } else { $defaultWorkDir }
-
-$HTTPS_PROXY_VAL = Read-Host "  HTTPS proxy, e.g. http://127.0.0.1:7890 (leave blank to skip)"
+$PORT = Read-Value "Listening port" $defaultPort
+$WORK_DIR = Read-Value "Working directory for codex" $defaultWorkDir
+$HTTPS_PROXY_VAL = Read-OptionalValue "HTTPS proxy, e.g. http://127.0.0.1:7890" $defaultProxy
 
 Write-Host ""
 
@@ -168,6 +232,31 @@ try {
     Write-Ok "Running! $count models available."
 } catch {
     Write-Warn "Could not reach http://127.0.0.1:$PORT/v1/models — check logs at $LogFile"
+}
+
+if ($SyncDroid) {
+    Write-Host ""
+    Write-Host "  Syncing Droid models..." -ForegroundColor White
+    $resolvedDroidBaseUrl = if ($DroidBaseUrl) { $DroidBaseUrl.TrimEnd("/") } else { "http://127.0.0.1:$PORT/v1" }
+    $resolvedDroidApiKey = if ($DroidApiKey) { $DroidApiKey } else { "sk-codex-gateway" }
+    $resolvedDroidProvider = if ($DroidProvider) { $DroidProvider } else { "generic-chat-completion-api" }
+    $droidArgs = @(
+        (Join-Path $RepoDir "scripts\install-droid-models.mjs"),
+        "--base-url", $resolvedDroidBaseUrl,
+        "--api-key", $resolvedDroidApiKey,
+        "--provider", $resolvedDroidProvider
+    )
+    if ($SetDefaultDroid) {
+        $droidArgs += "--set-default"
+    }
+    if ($NoDroidBackup) {
+        $droidArgs += "--no-backup"
+    }
+    & $NodePath $droidArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "Droid sync failed."
+        exit $LASTEXITCODE
+    }
 }
 
 # ── done ─────────────────────────────────────────────────────────────────────
