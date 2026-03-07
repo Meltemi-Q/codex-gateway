@@ -255,6 +255,9 @@ async function writeJson(file, data) {
 
 async function resolveModels(baseUrl, codexHome) {
   const gatewayEndpoint = `${baseUrl}/models`;
+  const resolvedSources = [];
+  const mergedModels = new Set();
+
   try {
     const response = await fetch(gatewayEndpoint);
     if (!response.ok) {
@@ -263,14 +266,15 @@ async function resolveModels(baseUrl, codexHome) {
     const data = await response.json();
     const models = uniq(Array.isArray(data?.data) ? data.data.map((entry) => entry?.id) : []);
     if (models.length > 0) {
-      return { source: gatewayEndpoint, models: sortModels(models) };
+      resolvedSources.push(gatewayEndpoint);
+      for (const model of models) mergedModels.add(model);
     }
   } catch {}
 
   const cacheFile = path.join(codexHome, "models_cache.json");
   try {
     const raw = await fs.readFile(cacheFile, "utf-8");
-    const data = JSON.parse(raw);
+    const data = parseJsonFile(raw);
     const models = uniq(
       Array.isArray(data?.models)
         ? data.models
@@ -279,9 +283,14 @@ async function resolveModels(baseUrl, codexHome) {
         : []
     );
     if (models.length > 0) {
-      return { source: cacheFile, models: sortModels(models) };
+      resolvedSources.push(cacheFile);
+      for (const model of models) mergedModels.add(model);
     }
   } catch {}
+
+  if (mergedModels.size > 0) {
+    return { source: resolvedSources.join(" + "), models: sortModels([...mergedModels]) };
+  }
 
   return { source: "built-in fallback", models: [...FALLBACK_MODELS] };
 }
