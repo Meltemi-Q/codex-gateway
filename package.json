@@ -8,7 +8,8 @@
     "codex-gateway": "index.mjs"
   },
   "scripts": {
-    "start": "node index.mjs"
+    "start": "node index.mjs",
+    "sync:droid": "node scripts/install-droid-models.mjs"
   },
   "keywords": ["openai", "codex", "proxy", "gateway", "openai-compatible", "cli"],
   "author": "Meltemi-Q",

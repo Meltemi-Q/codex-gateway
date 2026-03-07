@@ -9,7 +9,7 @@
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET` | `/v1/models` | 获取可用模型列表（实时） |
-| `POST` | `/v1/chat/completions` | 转发聊天请求给 Codex CLI |
+| `POST` | `/v1/chat/completions` | 转发聊天请求给 Codex CLI（支持流式和非流式） |
 
 完全兼容 OpenAI API 格式，任何支持 OpenAI SDK 的客户端都可以直接使用。
 
@@ -115,6 +115,29 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### 一键导入到 Droid
+
+如果你本地也在用 Droid，可以用一条命令把当前 codex-gateway 模型列表写入 `~/.factory/config.json` 和 `~/.factory/settings.json`：
+
+```bash
+npm run sync:droid
+```
+
+常用参数：
+
+```bash
+# 同时把 GPT-5.4 [Codex Gateway] 设为 Droid 默认会话模型
+npm run sync:droid -- --set-default
+
+# 指向不同的 Droid baseUrl
+npm run sync:droid -- --base-url http://127.0.0.1:8400/v1
+```
+
+导入脚本会：
+- 使用 `provider: "generic-chat-completion-api"` 写入 Droid 模型
+- 在覆盖前自动生成 `config.json.bak` 和 `settings.json.bak`
+- 优先读取正在运行的网关 `/v1/models`，不可用时回退到 `~/.codex/models_cache.json`
 
 ### 配合 cliproxyapi 使用
 

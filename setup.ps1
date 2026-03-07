@@ -117,9 +117,13 @@ if ($HTTPS_PROXY_VAL) {
     $HTTP_PROXY_VAL = $HTTPS_PROXY_VAL
     $ALL_PROXY_VAL  = $HTTPS_PROXY_VAL -replace "^http", "socks5"
     $lines += "set HTTPS_PROXY=$HTTPS_PROXY_VAL"
+    $lines += "set https_proxy=$HTTPS_PROXY_VAL"
     $lines += "set HTTP_PROXY=$HTTP_PROXY_VAL"
+    $lines += "set http_proxy=$HTTP_PROXY_VAL"
     $lines += "set ALL_PROXY=$ALL_PROXY_VAL"
+    $lines += "set all_proxy=$ALL_PROXY_VAL"
     $lines += "set NO_PROXY=localhost,127.0.0.1,::1"
+    $lines += "set no_proxy=localhost,127.0.0.1,::1"
 }
 $lines += "`"$NodePath`" `"$Script`" >> `"$LogFile`" 2>&1"
 

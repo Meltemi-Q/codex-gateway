@@ -9,7 +9,7 @@ A zero-dependency, OpenAI-compatible HTTP gateway that wraps the [Codex CLI](htt
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/models` | List available Codex models (live from cache) |
-| `POST` | `/v1/chat/completions` | Forward a chat request to the Codex CLI |
+| `POST` | `/v1/chat/completions` | Forward chat requests to the Codex CLI (streaming and non-streaming) |
 
 The API is OpenAI-compatible — any client that works with the OpenAI SDK will work with codex-gateway.
 
@@ -89,6 +89,29 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### One-click import into Droid
+
+If you use Droid locally, import the current codex-gateway model list into `~/.factory/config.json` and `~/.factory/settings.json` with one command:
+
+```bash
+npm run sync:droid
+```
+
+Useful flags:
+
+```bash
+# Also make GPT-5.4 [Codex Gateway] the default Droid session model
+npm run sync:droid -- --set-default
+
+# Write a different Droid base URL
+npm run sync:droid -- --base-url http://127.0.0.1:8400/v1
+```
+
+The importer:
+- writes Droid entries with `provider: "generic-chat-completion-api"`
+- creates `config.json.bak` and `settings.json.bak` before overwriting
+- reads the live gateway `/v1/models` endpoint when available, then falls back to `~/.codex/models_cache.json`
 
 ### Use with cliproxyapi
 

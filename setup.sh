@@ -143,11 +143,19 @@ if [[ "$PLATFORM" == "macos" ]]; then
     PROXY_BLOCK="
         <key>HTTPS_PROXY</key>
         <string>${HTTPS_PROXY_VAL}</string>
+        <key>https_proxy</key>
+        <string>${HTTPS_PROXY_VAL}</string>
         <key>HTTP_PROXY</key>
+        <string>${HTTPS_PROXY_VAL}</string>
+        <key>http_proxy</key>
         <string>${HTTPS_PROXY_VAL}</string>
         <key>ALL_PROXY</key>
         <string>${ALL_PROXY_VAL}</string>
+        <key>all_proxy</key>
+        <string>${ALL_PROXY_VAL}</string>
         <key>NO_PROXY</key>
+        <string>localhost,127.0.0.1,::1</string>
+        <key>no_proxy</key>
         <string>localhost,127.0.0.1,::1</string>"
   fi
 
@@ -197,9 +205,13 @@ elif [[ "$PLATFORM" == "linux" ]]; then
     ALL_PROXY_VAL="${HTTPS_PROXY_VAL/http/socks5}"
     PROXY_ENV="
 Environment=HTTPS_PROXY=${HTTPS_PROXY_VAL}
+Environment=https_proxy=${HTTPS_PROXY_VAL}
 Environment=HTTP_PROXY=${HTTPS_PROXY_VAL}
+Environment=http_proxy=${HTTPS_PROXY_VAL}
 Environment=ALL_PROXY=${ALL_PROXY_VAL}
-Environment=NO_PROXY=localhost,127.0.0.1,::1"
+Environment=all_proxy=${ALL_PROXY_VAL}
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Environment=no_proxy=localhost,127.0.0.1,::1"
   fi
 
   cat > "$UNIT_FILE" <<UNIT

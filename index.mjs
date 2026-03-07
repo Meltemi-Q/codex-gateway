@@ -137,7 +137,17 @@ function messagesToPrompt(messages) {
   return messages
     .map((m) => {
       const role = m.role === "system" ? "[System]" : m.role === "assistant" ? "[Assistant]" : "[User]";
-      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const content = Array.isArray(m.content)
+        ? m.content
+            .map((part) => {
+              if (typeof part === "string") return part;
+              if (part?.type === "text") return part.text ?? "";
+              return JSON.stringify(part);
+            })
+            .join("\n")
+        : typeof m.content === "string"
+          ? m.content
+          : JSON.stringify(m.content);
       return `${role}\n${content}`;
     })
     .join("\n\n---\n\n");
@@ -148,6 +158,7 @@ function messagesToPrompt(messages) {
  */
 async function runCodex(model, prompt) {
   const tmpFile = path.join(os.tmpdir(), `cgw-${crypto.randomBytes(8).toString("hex")}.txt`);
+  const modelReasoningEffort = /mini/i.test(model) ? "high" : "xhigh";
 
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -159,6 +170,7 @@ async function runCodex(model, prompt) {
         "exec",
         "--skip-git-repo-check",    // allow non-git work dirs (needed on Linux servers)
         "--model", model,
+        "-c", `model_reasoning_effort=${modelReasoningEffort}`,
         "--output-last-message", tmpFile,
         "-",                        // read prompt from stdin
       ],
@@ -183,8 +195,14 @@ async function runCodex(model, prompt) {
       try { await fs.unlink(tmpFile); } catch {}
 
       const content = lastMsg || stdout.trim() || stderr.trim() || "(no response)";
-      console.log(`[codex-gateway] model=${model} code=${code} elapsed=${elapsed}s len=${content.length}`);
-      resolve(content);
+      console.log(
+        `[codex-gateway] model=${model} effort=${modelReasoningEffort} code=${code} elapsed=${elapsed}s len=${content.length}`
+      );
+      if (code === 0) {
+        resolve(content);
+        return;
+      }
+      reject(new Error(content));
     });
   });
 }
@@ -202,6 +220,74 @@ function json(res, status, body) {
   if (res.headersSent) return;
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+function createChatCompletionPayload(model, content) {
+  return {
+    id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    usage: { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 },
+  };
+}
+
+function sendChatCompletionStream(res, model, content, includeUsage = false) {
+  const id = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
+  const created = Math.floor(Date.now() / 1000);
+  const usage = { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 };
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const writeChunk = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  writeChunk({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  });
+
+  if (content) {
+    writeChunk({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    });
+  }
+
+  writeChunk({
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    ...(includeUsage ? { usage } : {}),
+  });
+
+  if (includeUsage) {
+    writeChunk({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [],
+      usage,
+    });
+  }
+
+  res.end("data: [DONE]\n\n");
 }
 
 function readBody(req) {
@@ -247,8 +333,13 @@ async function handleRequest(req, res) {
 
     const model = payload.model || "gpt-5.4";
     const prompt = messagesToPrompt(payload.messages);
+    const stream = Boolean(payload.stream);
+    const includeUsage = Boolean(payload.stream_options?.include_usage);
+    const payloadKeys = Object.keys(payload || {}).sort().join(",");
 
-    console.log(`[codex-gateway] -> model=${model} messages=${payload.messages?.length ?? 0}`);
+    console.log(
+      `[codex-gateway] -> model=${model} stream=${stream} messages=${payload.messages?.length ?? 0} keys=${payloadKeys}`
+    );
 
     let content;
     try {
@@ -258,14 +349,11 @@ async function handleRequest(req, res) {
       return json(res, 500, { error: { message: err.message, type: "server_error", code: "internal_server_error" } });
     }
 
-    return json(res, 200, {
-      id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-      usage: { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 },
-    });
+    if (stream) {
+      return sendChatCompletionStream(res, model, content, includeUsage);
+    }
+
+    return json(res, 200, createChatCompletionPayload(model, content));
   }
 
   return json(res, 404, { error: { message: `${req.method} ${req.url} not found`, type: "not_found" } });
