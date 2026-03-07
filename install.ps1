@@ -49,6 +49,29 @@ Options:
 "@
 }
 
+function Sync-CheckoutFromGit([string]$DestinationDir, [string]$RepoUrl, [string]$Branch) {
+    $tempDir = Join-Path $env:TEMP ("codex-gateway-bootstrap-" + [guid]::NewGuid().ToString())
+    try {
+        & git clone --depth=1 --branch $Branch $RepoUrl $tempDir
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+
+        $items = Get-ChildItem -Force $tempDir | Where-Object { $_.Name -ne ".git" }
+        foreach ($item in $items) {
+            $target = Join-Path $DestinationDir $item.Name
+            if (Test-Path $target) {
+                Remove-Item -Recurse -Force $target
+            }
+            Copy-Item $item.FullName -Destination $target -Recurse -Force
+        }
+    } finally {
+        if (Test-Path $tempDir) {
+            Remove-Item -Recurse -Force $tempDir
+        }
+    }
+}
+
 if ($Help) {
     Show-Usage
     exit 0
@@ -71,7 +94,20 @@ if (Test-Path (Join-Path $Dir ".git")) {
         }
     }
 } elseif (Test-Path $Dir) {
-    Write-Error "Install dir exists but is not a git repo: $Dir"
+    $hasLocalCheckout = (Test-Path (Join-Path $Dir "setup.ps1")) -and (Test-Path (Join-Path $Dir "index.mjs"))
+    $dirEntries = @(Get-ChildItem -Force -ErrorAction SilentlyContinue $Dir)
+    if ($hasLocalCheckout) {
+        Write-Host "Refreshing existing local checkout without git metadata: $Dir" -ForegroundColor Yellow
+        Sync-CheckoutFromGit -DestinationDir $Dir -RepoUrl $RepoUrl -Branch $Branch
+    } elseif ($dirEntries.Count -eq 0) {
+        Write-Host "Cloning repo into existing empty directory: $Dir" -ForegroundColor White
+        & git clone --depth=1 --branch $Branch $RepoUrl $Dir
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    } else {
+        Write-Error "Install dir exists but is not a git repo: $Dir"
+    }
 } else {
     Write-Host "Cloning repo into: $Dir" -ForegroundColor White
     & git clone --depth=1 --branch $Branch $RepoUrl $Dir
