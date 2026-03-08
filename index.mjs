@@ -34,12 +34,50 @@ import { existsSync } from "node:fs";
 const PORT = parseInt(process.env.PORT || "8319", 10);
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const MODELS_CACHE_FILE = path.join(CODEX_HOME, "models_cache.json");
+const AUTH_FILE = path.join(CODEX_HOME, "auth.json");
 const WORK_DIR = process.env.WORK_DIR || process.cwd();
 
 // Daily token budget (configurable via env, default 10M tokens — rough Codex Pro daily limit)
 const DAILY_TOKEN_BUDGET = parseInt(process.env.DAILY_TOKEN_BUDGET || "10000000", 10);
 // Warning threshold percentage
 const WARN_THRESHOLD = parseFloat(process.env.WARN_THRESHOLD || "0.8"); // 80%
+
+// ---------------------------------------------------------------------------
+// Account info (decoded from JWT in auth.json)
+// ---------------------------------------------------------------------------
+
+let accountInfo = null;
+
+async function loadAccountInfo() {
+  try {
+    const raw = await fs.readFile(AUTH_FILE, "utf-8");
+    const auth = JSON.parse(raw);
+    const accessToken = auth.tokens?.access_token;
+    if (!accessToken) return;
+
+    // Decode JWT payload (no verification needed, just reading claims)
+    const parts = accessToken.split(".");
+    if (parts.length < 2) return;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+
+    const authClaims = payload["https://api.openai.com/auth"] || {};
+    const profileClaims = payload["https://api.openai.com/profile"] || {};
+
+    accountInfo = {
+      plan: authClaims.chatgpt_plan_type || "unknown",
+      account_id: authClaims.chatgpt_account_id || null,
+      user_id: authClaims.chatgpt_user_id || null,
+      email: profileClaims.email || null,
+      compute_residency: authClaims.chatgpt_compute_residency || null,
+      token_expires: payload.exp ? new Date(payload.exp * 1000).toISOString() : null,
+      token_issued: payload.iat ? new Date(payload.iat * 1000).toISOString() : null,
+    };
+
+    console.log(`[codex-gateway] account: plan=${accountInfo.plan} email=${accountInfo.email} expires=${accountInfo.token_expires}`);
+  } catch {
+    // auth.json missing or malformed
+  }
+}
 
 // Resolve the codex binary: CODEX_PATH env > same node_modules as the running
 // node > well-known paths > fallback to "codex" on PATH.
@@ -246,6 +284,7 @@ function getStatsSnapshot() {
       errors: usageStats.total_errors,
     },
     by_model: usageStats.by_model,
+    account: accountInfo,
     started_at: usageStats.started_at,
     // Last 7 days summary for quick glance
     recent_days: getRecentDaysSummary(7),
@@ -756,6 +795,7 @@ async function handleRequest(req, res) {
         effective_user_budget_tokens: "~254000",
       },
       models_count: cachedModels.length,
+      account: accountInfo,
       config: { port: PORT, work_dir: WORK_DIR, codex_path: CODEX_PATH },
     });
   }
@@ -824,8 +864,17 @@ async function handleRequest(req, res) {
 // ---------------------------------------------------------------------------
 
 await refreshModels();
+await loadAccountInfo();
 await loadStats();
 watchModelCache();
+
+// Watch auth.json for token refreshes (plan info may change)
+try {
+  fsWatch(AUTH_FILE, { persistent: false }, (event) => {
+    if (event === "change") loadAccountInfo();
+  });
+} catch {}
+
 
 const server = http.createServer(async (req, res) => {
   try {
