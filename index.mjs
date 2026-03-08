@@ -4,15 +4,27 @@
  * Models are auto-discovered by watching ~/.codex/models_cache.json —
  * any new model Codex CLI fetches from upstream becomes available immediately.
  *
+ * Multi-account rotation: the gateway automatically discovers auth-*.json
+ * files in CODEX_HOME, provisions isolated account directories under
+ * CODEX_HOME/accounts/, and distributes requests evenly via round-robin.
+ * When a rate-limit (429) or quota error is detected the failing account
+ * enters a cooldown period and the request is retried on the next account.
+ * Each account tracks its own consumption percentage independently;
+ * aggregate cost is reported globally.
+ *
  * Endpoints:
  *   GET  /v1/models              → list available Codex models
  *   POST /v1/chat/completions    → forward to Codex CLI (any model name)
+ *   GET  /v1/stats               → usage stats (global + per-account)
+ *   GET  /v1/stats/history       → daily history
+ *   GET  /v1/accounts            → account pool status
  *
  * Config (environment variables):
  *   PORT              Server port (default: 8319)
  *   CODEX_PATH        Path to codex binary (auto-detected)
  *   CODEX_HOME        Codex data dir (default: ~/.codex)
  *   WORK_DIR          Working directory for codex CLI (default: cwd)
+ *   ACCOUNT_COOLDOWN_MS  Cooldown after rate-limit per account (default: 300000 = 5 min)
  *   HTTPS_PROXY       Upstream proxy (forwarded to codex subprocess)
  *   HTTP_PROXY        Upstream proxy (forwarded to codex subprocess)
  *   ALL_PROXY         Upstream proxy (forwarded to codex subprocess)
@@ -35,35 +47,45 @@ const PORT = parseInt(process.env.PORT || "8319", 10);
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const MODELS_CACHE_FILE = path.join(CODEX_HOME, "models_cache.json");
 const AUTH_FILE = path.join(CODEX_HOME, "auth.json");
+const ACCOUNTS_DIR = path.join(CODEX_HOME, "accounts");
 const WORK_DIR = process.env.WORK_DIR || process.cwd();
+const ACCOUNT_COOLDOWN_MS = parseInt(process.env.ACCOUNT_COOLDOWN_MS || "300000", 10); // 5 min default
+const ACCOUNT_SCAN_INTERVAL_MS = parseInt(process.env.ACCOUNT_SCAN_INTERVAL_MS || "60000", 10); // rescan every 60s
 
-// Daily token budget (configurable via env, default 10M tokens — rough Codex Pro daily limit)
+// Daily token budget per account (configurable via env, default 10M tokens)
 const DAILY_TOKEN_BUDGET = parseInt(process.env.DAILY_TOKEN_BUDGET || "10000000", 10);
-// Warning threshold percentage
 const WARN_THRESHOLD = parseFloat(process.env.WARN_THRESHOLD || "0.8"); // 80%
 
 // ---------------------------------------------------------------------------
-// Account info (decoded from JWT in auth.json)
+// Multi-account pool
 // ---------------------------------------------------------------------------
 
-let accountInfo = null;
+/**
+ * Each account entry:
+ * {
+ *   label: string,          — human-readable label (e.g. "qq964", "gmail964", "primary")
+ *   authFile: string,       — source auth-*.json path
+ *   codexHome: string,      — isolated CODEX_HOME for this account (accounts/{label}/)
+ *   info: object|null,      — decoded JWT info (plan, email, etc.)
+ *   cooldownUntil: number,  — timestamp (ms) when cooldown expires (0 = available)
+ *   stats: {                — per-account daily stats
+ *     date, requests, errors, input_tokens, output_tokens, cached_input_tokens
+ *   }
+ * }
+ */
+let accountPool = [];
+let roundRobinIndex = 0;
 
-async function loadAccountInfo() {
+function decodeAccountJWT(authJson) {
   try {
-    const raw = await fs.readFile(AUTH_FILE, "utf-8");
-    const auth = JSON.parse(raw);
-    const accessToken = auth.tokens?.access_token;
-    if (!accessToken) return;
-
-    // Decode JWT payload (no verification needed, just reading claims)
+    const accessToken = authJson.tokens?.access_token;
+    if (!accessToken) return null;
     const parts = accessToken.split(".");
-    if (parts.length < 2) return;
+    if (parts.length < 2) return null;
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
-
     const authClaims = payload["https://api.openai.com/auth"] || {};
     const profileClaims = payload["https://api.openai.com/profile"] || {};
-
-    accountInfo = {
+    return {
       plan: authClaims.chatgpt_plan_type || "unknown",
       account_id: authClaims.chatgpt_account_id || null,
       user_id: authClaims.chatgpt_user_id || null,
@@ -72,35 +94,291 @@ async function loadAccountInfo() {
       token_expires: payload.exp ? new Date(payload.exp * 1000).toISOString() : null,
       token_issued: payload.iat ? new Date(payload.iat * 1000).toISOString() : null,
     };
-
-    console.log(`[codex-gateway] account: plan=${accountInfo.plan} email=${accountInfo.email} expires=${accountInfo.token_expires}`);
   } catch {
-    // auth.json missing or malformed
+    return null;
   }
 }
 
-// Resolve the codex binary: CODEX_PATH env > same node_modules as the running
-// node > well-known paths > fallback to "codex" on PATH.
+function freshAccountStats() {
+  return {
+    date: todayStr(),
+    requests: 0,
+    errors: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cached_input_tokens: 0,
+  };
+}
+
+function ensureAccountStatsToday(acct) {
+  const today = todayStr();
+  if (acct.stats.date !== today) {
+    acct.stats = freshAccountStats();
+  }
+}
+
+// Shared files/dirs to symlink into each account's isolated CODEX_HOME
+const SHARED_ITEMS = ["models_cache.json", "config.toml", "memories", "rules", "skills"];
+
+async function provisionAccountDir(label) {
+  const dir = path.join(ACCOUNTS_DIR, label);
+  await fs.mkdir(dir, { recursive: true });
+
+  for (const item of SHARED_ITEMS) {
+    const src = path.join(CODEX_HOME, item);
+    const dst = path.join(dir, item);
+    try {
+      await fs.lstat(dst);
+    } catch {
+      try {
+        await fs.lstat(src);
+        await fs.symlink(src, dst);
+      } catch { /* source doesn't exist, skip */ }
+    }
+  }
+
+  return dir;
+}
+
+async function discoverAndProvisionAccounts() {
+  await fs.mkdir(ACCOUNTS_DIR, { recursive: true });
+
+  // Collect all auth-*.json from CODEX_HOME root
+  const sourceFiles = new Map(); // label -> source path
+  try {
+    const entries = await fs.readdir(CODEX_HOME);
+    for (const name of entries) {
+      // Match auth.json (primary) and auth-{label}.json
+      if (name === "auth.json") {
+        sourceFiles.set("primary", path.join(CODEX_HOME, name));
+      } else {
+        const m = name.match(/^auth-(.+)\.json$/);
+        if (m) sourceFiles.set(m[1], path.join(CODEX_HOME, name));
+      }
+    }
+  } catch { /* CODEX_HOME unreadable */ }
+
+  // Also scan accounts/ for any manually placed auth files
+  try {
+    const acctDirs = await fs.readdir(ACCOUNTS_DIR, { withFileTypes: true });
+    for (const d of acctDirs) {
+      if (d.isDirectory()) {
+        const authPath = path.join(ACCOUNTS_DIR, d.name, "auth.json");
+        try {
+          await fs.access(authPath);
+          if (!sourceFiles.has(d.name)) {
+            sourceFiles.set(d.name, authPath);
+          }
+        } catch { /* no auth.json in this dir */ }
+      }
+    }
+  } catch { /* accounts dir doesn't exist yet */ }
+
+  // Provision each account
+  const pool = [];
+  for (const [label, srcPath] of sourceFiles) {
+    try {
+      const raw = await fs.readFile(srcPath, "utf-8");
+      const authJson = JSON.parse(raw);
+      const codexHome = await provisionAccountDir(label);
+
+      // Copy auth.json into the account's isolated dir (always named auth.json)
+      const dstAuth = path.join(codexHome, "auth.json");
+      // Only copy if source is outside the account dir (avoid self-copy)
+      if (path.dirname(srcPath) !== codexHome) {
+        await fs.writeFile(dstAuth, raw);
+      }
+
+      const info = decodeAccountJWT(authJson);
+      pool.push({
+        label,
+        authFile: srcPath,
+        codexHome,
+        info,
+        cooldownUntil: 0,
+        stats: freshAccountStats(),
+      });
+
+      console.log(
+        `[codex-gateway] account: ${label} plan=${info?.plan || "?"} email=${info?.email || "?"} expires=${info?.token_expires || "?"}`
+      );
+    } catch (err) {
+      console.warn(`[codex-gateway] skipping account ${label}: ${err.message}`);
+    }
+  }
+
+  if (pool.length === 0) {
+    console.error("[codex-gateway] no accounts found! Place auth.json or auth-{label}.json in " + CODEX_HOME);
+  }
+
+  // De-duplicate by account_id (same account logged in twice)
+  const seen = new Map();
+  for (const acct of pool) {
+    const key = acct.info?.account_id || acct.label;
+    if (!seen.has(key)) {
+      seen.set(key, acct);
+    } else {
+      // Keep the one with later token expiry
+      const existing = seen.get(key);
+      const existExp = existing.info?.token_expires ? new Date(existing.info.token_expires).getTime() : 0;
+      const newExp = acct.info?.token_expires ? new Date(acct.info.token_expires).getTime() : 0;
+      if (newExp > existExp) {
+        seen.set(key, acct);
+        console.log(`[codex-gateway] dedup: ${acct.label} supersedes ${existing.label} (newer token)`);
+      } else {
+        console.log(`[codex-gateway] dedup: ${existing.label} kept over ${acct.label}`);
+      }
+    }
+  }
+
+  // Preserve per-account stats and cooldown state for accounts that already existed
+  const newPool = [...seen.values()];
+  const oldByLabel = new Map(accountPool.map((a) => [a.label, a]));
+  for (const acct of newPool) {
+    const old = oldByLabel.get(acct.label);
+    if (old) {
+      acct.stats = old.stats;
+      acct.cooldownUntil = old.cooldownUntil;
+    }
+  }
+
+  const oldLabels = accountPool.map((a) => a.label).sort().join(",");
+  const newLabels = newPool.map((a) => a.label).sort().join(",");
+  accountPool = newPool;
+
+  if (oldLabels !== newLabels) {
+    console.log(`[codex-gateway] account pool: ${accountPool.length} accounts [${accountPool.map((a) => a.label).join(", ")}]`);
+  }
+}
+
+/** Periodic re-sync: update auth.json inside each account dir from source files */
+async function syncAccountAuthFiles() {
+  for (const acct of accountPool) {
+    try {
+      const srcPath = acct.authFile;
+      const dstPath = path.join(acct.codexHome, "auth.json");
+      if (path.dirname(srcPath) === acct.codexHome) continue;
+
+      const srcStat = await fs.stat(srcPath).catch(() => null);
+      const dstStat = await fs.stat(dstPath).catch(() => null);
+      if (!srcStat) continue;
+
+      // Only copy if source is newer
+      if (!dstStat || srcStat.mtimeMs > dstStat.mtimeMs) {
+        const raw = await fs.readFile(srcPath, "utf-8");
+        await fs.writeFile(dstPath, raw);
+        const authJson = JSON.parse(raw);
+        const newInfo = decodeAccountJWT(authJson);
+        if (newInfo) acct.info = newInfo;
+        console.log(`[codex-gateway] synced auth for account ${acct.label}`);
+      }
+    } catch { /* best effort */ }
+  }
+}
+
+function isMultiAccountMode() {
+  return accountPool.length > 1;
+}
+
+function pickNextAccount() {
+  if (accountPool.length === 0) return null;
+  if (!isMultiAccountMode()) return accountPool[0];
+
+  const now = Date.now();
+  const total = accountPool.length;
+
+  // Try round-robin, skipping cooled-down accounts
+  for (let i = 0; i < total; i++) {
+    const idx = (roundRobinIndex + i) % total;
+    const acct = accountPool[idx];
+    if (acct.cooldownUntil <= now) {
+      roundRobinIndex = (idx + 1) % total;
+      return acct;
+    }
+  }
+
+  // All accounts are on cooldown — pick the one that expires soonest
+  let soonest = accountPool[0];
+  for (const acct of accountPool) {
+    if (acct.cooldownUntil < soonest.cooldownUntil) soonest = acct;
+  }
+  console.warn(
+    `[codex-gateway] all accounts on cooldown, using ${soonest.label} (cooldown ends ${new Date(soonest.cooldownUntil).toISOString()})`
+  );
+  return soonest;
+}
+
+function markAccountCooldown(acct) {
+  acct.cooldownUntil = Date.now() + ACCOUNT_COOLDOWN_MS;
+  acct.stats.errors += 1;
+  console.warn(
+    `[codex-gateway] account ${acct.label} rate-limited, cooldown until ${new Date(acct.cooldownUntil).toISOString()}`
+  );
+}
+
+function recordAccountUsage(acct, usage) {
+  if (!usage) return;
+  ensureAccountStatsToday(acct);
+  acct.stats.requests += 1;
+  acct.stats.input_tokens += usage.input_tokens || 0;
+  acct.stats.output_tokens += usage.output_tokens || 0;
+  acct.stats.cached_input_tokens += usage.cached_input_tokens || 0;
+}
+
+function getAccountPoolStatus() {
+  const now = Date.now();
+  return accountPool.map((acct) => {
+    ensureAccountStatsToday(acct);
+    const totalTokens = acct.stats.input_tokens + acct.stats.output_tokens;
+    const pct = totalTokens / DAILY_TOKEN_BUDGET;
+    return {
+      label: acct.label,
+      plan: acct.info?.plan || "unknown",
+      email: acct.info?.email || null,
+      token_expires: acct.info?.token_expires || null,
+      status: acct.cooldownUntil > now ? "cooldown" : "available",
+      cooldown_remaining_sec: acct.cooldownUntil > now ? Math.ceil((acct.cooldownUntil - now) / 1000) : 0,
+      today: {
+        requests: acct.stats.requests,
+        errors: acct.stats.errors,
+        tokens: totalTokens,
+        usage_percent: parseFloat((pct * 100).toFixed(2)),
+        budget: DAILY_TOKEN_BUDGET,
+      },
+    };
+  });
+}
+
+// Backward-compat: expose the active account info as the legacy accountInfo
+let accountInfo = null;
+function updateLegacyAccountInfo() {
+  if (accountPool.length > 0) {
+    accountInfo = accountPool[0].info;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resolve codex binary
+// ---------------------------------------------------------------------------
+
 function resolveCodexPath() {
   if (process.env.CODEX_PATH) return process.env.CODEX_PATH;
-  // Prefer the same nvm node version that started this process
   const nodeDir = path.dirname(process.execPath);
   const candidate = path.join(nodeDir, "codex");
   if (existsSync(candidate)) return candidate;
   for (const p of ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]) {
     if (existsSync(p)) return p;
   }
-  return "codex"; // rely on PATH
+  return "codex";
 }
 const CODEX_PATH = resolveCodexPath();
-const NODE_PATH = process.execPath; // same node that launched us
+const NODE_PATH = process.execPath;
 
 // ---------------------------------------------------------------------------
 // Model pricing ($ per 1M tokens, source: openai.com/api/pricing 2026-03-05)
 // ---------------------------------------------------------------------------
 
 const MODEL_PRICING = {
-  // { input, cached_input, output } per 1M tokens
   "gpt-5":                { input: 1.25,  cached: 0.125,  output: 10.00 },
   "gpt-5-codex":          { input: 1.25,  cached: 0.125,  output: 10.00 },
   "gpt-5-codex-mini":     { input: 0.25,  cached: 0.025,  output: 2.00  },
@@ -111,10 +389,9 @@ const MODEL_PRICING = {
   "gpt-5.2":              { input: 1.75,  cached: 0.175,  output: 14.00 },
   "gpt-5.2-codex":        { input: 1.75,  cached: 0.175,  output: 14.00 },
   "gpt-5.3-codex":        { input: 1.75,  cached: 0.175,  output: 14.00 },
-  "gpt-5.4":              { input: 1.75,  cached: 0.175,  output: 14.00 }, // same tier as 5.3
+  "gpt-5.4":              { input: 1.75,  cached: 0.175,  output: 14.00 },
 };
 
-// Fallback pricing for unknown models (use gpt-5.1 tier as safe default)
 const DEFAULT_PRICING = { input: 1.25, cached: 0.125, output: 10.00 };
 
 function getModelPricing(model) {
@@ -131,7 +408,7 @@ function calcCost(model, usage) {
 }
 
 // ---------------------------------------------------------------------------
-// Usage statistics (resets daily)
+// Usage statistics — global aggregate (resets daily)
 // ---------------------------------------------------------------------------
 
 const STATS_FILE = path.join(CODEX_HOME, "gateway_stats.json");
@@ -145,22 +422,18 @@ const usageStats = {
   total_output_tokens: 0,
   total_requests: 0,
   total_errors: 0,
-  by_model: {},        // { model: { input, cached_input, output, requests, cost_usd } }
+  by_model: {},
   started_at: new Date().toISOString(),
 };
 
-// Daily history: array of past day snapshots
 let statsHistory = [];
 
 function todayStr() {
   return new Date().toISOString().slice(0, 10);
 }
 
-/** Archive current day's stats to history, then reset for new day. */
 async function archiveAndReset(newDay) {
-  // Only archive if there were any requests
   if (usageStats.total_requests > 0) {
-    // Build a compact summary for the archive
     let totalCost = 0;
     for (const m of Object.values(usageStats.by_model)) totalCost += m.cost_usd || 0;
 
@@ -180,18 +453,15 @@ async function archiveAndReset(newDay) {
 
     statsHistory.push(summary);
 
-    // Prune old entries beyond HISTORY_KEEP_DAYS
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - HISTORY_KEEP_DAYS);
     const cutoffStr = cutoff.toISOString().slice(0, 10);
     statsHistory = statsHistory.filter((s) => s.date >= cutoffStr);
 
-    // Persist history
     await fs.writeFile(HISTORY_FILE, JSON.stringify(statsHistory, null, 2)).catch(() => {});
     console.log(`[codex-gateway] archived ${usageStats.date}: ${usageStats.total_requests} reqs, $${totalCost.toFixed(4)}`);
   }
 
-  // Reset for new day
   usageStats.date = newDay;
   usageStats.total_input_tokens = 0;
   usageStats.total_cached_input_tokens = 0;
@@ -200,13 +470,20 @@ async function archiveAndReset(newDay) {
   usageStats.total_errors = 0;
   usageStats.by_model = {};
   usageStats.started_at = new Date().toISOString();
+
+  // Reset per-account stats too
+  for (const acct of accountPool) {
+    acct.stats = freshAccountStats();
+    acct.cooldownUntil = 0;
+  }
+
   console.log(`[codex-gateway] stats reset for new day: ${newDay}`);
 }
 
 function ensureTodayStats() {
   const today = todayStr();
   if (usageStats.date !== today) {
-    archiveAndReset(today); // fire-and-forget (async but we don't await in hot path)
+    archiveAndReset(today);
   }
 }
 
@@ -233,28 +510,26 @@ function recordUsage(model, usage) {
   m.requests += 1;
   m.cost_usd = parseFloat((m.cost_usd + cost).toFixed(6));
 
-  // Persist async (best-effort)
   fs.writeFile(STATS_FILE, JSON.stringify(usageStats, null, 2)).catch(() => {});
 
-  // Warn if approaching budget
   const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
-  const pct = totalUsed / DAILY_TOKEN_BUDGET;
+  const pct = totalUsed / (DAILY_TOKEN_BUDGET * Math.max(accountPool.length, 1));
   if (pct >= 1.0) {
-    console.warn(`[codex-gateway] ⚠️  BUDGET EXCEEDED: ${totalUsed.toLocaleString()} / ${DAILY_TOKEN_BUDGET.toLocaleString()} tokens (${(pct * 100).toFixed(1)}%)`);
+    console.warn(`[codex-gateway] BUDGET EXCEEDED (all accounts): ${totalUsed.toLocaleString()} tokens`);
   } else if (pct >= WARN_THRESHOLD) {
-    console.warn(`[codex-gateway] ⚠️  Budget warning: ${totalUsed.toLocaleString()} / ${DAILY_TOKEN_BUDGET.toLocaleString()} tokens (${(pct * 100).toFixed(1)}%)`);
+    console.warn(`[codex-gateway] Budget warning (all accounts): ${(pct * 100).toFixed(1)}%`);
   }
 }
 
 function getStatsSnapshot() {
   ensureTodayStats();
   const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
-  const pct = totalUsed / DAILY_TOKEN_BUDGET;
+  const globalBudget = DAILY_TOKEN_BUDGET * Math.max(accountPool.length, 1);
+  const pct = totalUsed / globalBudget;
   let status = "ok";
   if (pct >= 1.0) status = "exceeded";
   else if (pct >= WARN_THRESHOLD) status = "warning";
 
-  // Sum cost across all models
   let totalCost = 0;
   for (const m of Object.values(usageStats.by_model)) {
     totalCost += m.cost_usd || 0;
@@ -263,9 +538,11 @@ function getStatsSnapshot() {
   return {
     date: usageStats.date,
     budget: {
-      daily_limit: DAILY_TOKEN_BUDGET,
+      daily_limit_per_account: DAILY_TOKEN_BUDGET,
+      total_accounts: accountPool.length,
+      total_budget: globalBudget,
       total_used: totalUsed,
-      remaining: Math.max(0, DAILY_TOKEN_BUDGET - totalUsed),
+      remaining: Math.max(0, globalBudget - totalUsed),
       usage_percent: parseFloat((pct * 100).toFixed(2)),
       status,
       warn_threshold_percent: WARN_THRESHOLD * 100,
@@ -284,9 +561,8 @@ function getStatsSnapshot() {
       errors: usageStats.total_errors,
     },
     by_model: usageStats.by_model,
-    account: accountInfo,
+    accounts: getAccountPoolStatus(),
     started_at: usageStats.started_at,
-    // Last 7 days summary for quick glance
     recent_days: getRecentDaysSummary(7),
   };
 }
@@ -309,7 +585,6 @@ function getRecentDaysSummary(days) {
 }
 
 function getFullHistory() {
-  // Include today as the last entry
   ensureTodayStats();
   let todayCost = 0;
   for (const m of Object.values(usageStats.by_model)) todayCost += m.cost_usd || 0;
@@ -329,7 +604,6 @@ function getFullHistory() {
     cost_usd: d.cost_usd,
   }));
 
-  // Grand totals
   let grandTokens = todayEntry.tokens, grandCost = todayEntry.cost_usd, grandReqs = todayEntry.requests;
   for (const d of history) {
     grandTokens += d.tokens;
@@ -348,9 +622,7 @@ function getFullHistory() {
   };
 }
 
-// Load stats from disk on startup (resume today's counts)
 async function loadStats() {
-  // Load history
   try {
     const raw = await fs.readFile(HISTORY_FILE, "utf-8");
     statsHistory = JSON.parse(raw);
@@ -360,13 +632,11 @@ async function loadStats() {
     statsHistory = [];
   }
 
-  // Load today's stats
   try {
     const raw = await fs.readFile(STATS_FILE, "utf-8");
     const saved = JSON.parse(raw);
     if (saved.date === todayStr()) {
       Object.assign(usageStats, saved);
-      // Backfill cost_usd for models loaded from old stats format
       for (const [model, m] of Object.entries(usageStats.by_model)) {
         if (m.cost_usd == null) {
           m.cost_usd = calcCost(model, {
@@ -381,7 +651,6 @@ async function loadStats() {
       for (const m of Object.values(usageStats.by_model)) totalCost += m.cost_usd || 0;
       console.log(`[codex-gateway] resumed today's stats: ${totalUsed.toLocaleString()} tokens, ${usageStats.total_requests} requests, $${totalCost.toFixed(4)}`);
     } else if (saved.date && saved.date !== todayStr() && saved.total_requests > 0) {
-      // Yesterday's stats not yet archived — archive now
       Object.assign(usageStats, saved);
       await archiveAndReset(todayStr());
     }
@@ -397,8 +666,6 @@ async function loadStats() {
 const FALLBACK_MODELS = ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "gpt-5"];
 
 let cachedModels = FALLBACK_MODELS.map((s) => buildModelEntry(s));
-
-// Store full model metadata for context_window, reasoning levels, etc.
 let modelMetadata = new Map();
 
 function buildModelEntry(slug, created, meta) {
@@ -408,7 +675,6 @@ function buildModelEntry(slug, created, meta) {
     created: created ?? Math.floor(Date.now() / 1000),
     owned_by: "openai",
   };
-  // Expose context_window and supported reasoning levels in model info
   if (meta) {
     entry.context_window = meta.context_window;
     entry.effective_context_window_percent = meta.effective_context_window_percent;
@@ -442,7 +708,6 @@ async function refreshModels() {
   }
 }
 
-// Watch models_cache.json for changes written by the Codex CLI
 function watchModelCache() {
   try {
     fsWatch(MODELS_CACHE_FILE, { persistent: false }, (event) => {
@@ -458,21 +723,20 @@ function watchModelCache() {
 // Codex CLI invocation
 // ---------------------------------------------------------------------------
 
-/** Build the env for the codex subprocess, ensuring proxy and HOME are set. */
-function buildSpawnEnv() {
+function buildSpawnEnv(acct) {
   const env = { ...process.env };
-
-  // Ensure HOME so codex can find ~/.codex/auth.json
   if (!env.HOME) env.HOME = os.homedir();
 
-  // Propagate proxy settings from our own env (already set by launchd plist or shell)
-  // If caller set explicit proxy vars, those take precedence.
+  // Only override CODEX_HOME in multi-account mode
+  if (acct && isMultiAccountMode()) {
+    env.CODEX_HOME = acct.codexHome;
+  }
+
   const proxyVars = ["https_proxy", "http_proxy", "all_proxy", "no_proxy", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"];
   for (const v of proxyVars) {
     if (process.env[v] && !env[v]) env[v] = process.env[v];
   }
 
-  // Make sure the node bin directory is on PATH so the codex shebang resolves
   const nodeDir = path.dirname(process.execPath);
   const existingPath = env.PATH || "";
   if (!existingPath.includes(nodeDir)) {
@@ -482,11 +746,6 @@ function buildSpawnEnv() {
   return env;
 }
 
-/**
- * Convert an OpenAI messages array into a plain-text prompt for the Codex CLI.
- * Codex is an agentic model — we format the conversation clearly so it
- * understands the context and only needs to reply to the last user turn.
- */
 function messagesToPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) return "";
   return messages
@@ -508,11 +767,6 @@ function messagesToPrompt(messages) {
     .join("\n\n---\n\n");
 }
 
-/**
- * Resolve reasoning effort for a model.
- * Priority: client request > auto-detect from model name.
- * Validates against supported levels from model metadata.
- */
 function resolveReasoningEffort(model, clientEffort) {
   const meta = modelMetadata.get(model);
   const supported = meta?.supported_reasoning_levels?.map((l) =>
@@ -520,35 +774,41 @@ function resolveReasoningEffort(model, clientEffort) {
   );
 
   if (clientEffort && supported?.includes(clientEffort)) return clientEffort;
-  if (clientEffort && !supported) return clientEffort; // no metadata, trust client
+  if (clientEffort && !supported) return clientEffort;
 
-  // Default: mini → high, others → xhigh
   const defaultEffort = /mini/i.test(model) ? "high" : "xhigh";
   if (supported?.includes(defaultEffort)) return defaultEffort;
-  // Fallback to highest supported
   if (supported?.length) return supported[supported.length - 1];
   return defaultEffort;
 }
 
+// Rate-limit detection patterns in stderr/error output
+const RATE_LIMIT_PATTERNS = [
+  /rate.?limit/i,
+  /too many requests/i,
+  /429/,
+  /quota/i,
+  /capacity/i,
+  /usage.?limit/i,
+  /exceeded.*limit/i,
+];
+
+function isRateLimitError(errorText) {
+  return RATE_LIMIT_PATTERNS.some((re) => re.test(errorText));
+}
+
 /**
- * Run `codex exec` and return the assistant's last message.
- * @param {string} model - Model slug
- * @param {string} prompt - Plain-text prompt
- * @param {object} [opts] - Extra options from client request
- * @param {string} [opts.reasoning_effort] - Reasoning effort level
- * @param {number} [opts.max_tokens] - Max output tokens (mapped to model_max_output_tokens)
- * @param {boolean} [opts.fast_mode] - Enable/disable fast mode (default: false)
+ * Run `codex exec` using a specific account.
+ * Returns { content, usage, rateLimited }
  */
-async function runCodex(model, prompt, opts = {}) {
+async function runCodexWithAccount(model, prompt, opts, acct) {
   const effort = resolveReasoningEffort(model, opts.reasoning_effort);
 
-  // Build config overrides
   const configArgs = ["-c", `model_reasoning_effort=${effort}`];
   if (opts.max_tokens && Number.isFinite(opts.max_tokens)) {
     configArgs.push("-c", `model_max_output_tokens=${opts.max_tokens}`);
   }
 
-  // Feature toggles — fast_mode defaults to OFF for higher quality
   const featureArgs = [];
   if (opts.fast_mode === true) {
     featureArgs.push("--enable", "fast_mode");
@@ -561,18 +821,18 @@ async function runCodex(model, prompt, opts = {}) {
       NODE_PATH,
       [
         CODEX_PATH,
-        "-a", "never",              // never ask for approval
-        "-s", "workspace-write",    // minimal sandbox
+        "-a", "never",
+        "-s", "workspace-write",
         "exec",
-        "--ephemeral",              // no session persistence
-        "--skip-git-repo-check",    // allow non-git work dirs (needed on Linux servers)
-        "--json",                   // JSONL output for precise token tracking
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--json",
         "--model", model,
         ...configArgs,
         ...featureArgs,
-        "-",                        // read prompt from stdin
+        "-",
       ],
-      { cwd: WORK_DIR, env: buildSpawnEnv(), stdio: ["pipe", "pipe", "pipe"] }
+      { cwd: WORK_DIR, env: buildSpawnEnv(acct), stdio: ["pipe", "pipe", "pipe"] }
     );
 
     let stdout = "";
@@ -589,48 +849,104 @@ async function runCodex(model, prompt, opts = {}) {
     child.on("close", (code) => {
       const elapsed = Math.floor((Date.now() - started) / 1000);
 
-      // Parse JSONL output from codex --json
       let lastAgentText = "";
       let turnUsage = null;
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         try {
           const evt = JSON.parse(line);
-          // Capture the last agent_message text
           if (evt.type === "item.completed" && evt.item?.type === "agent_message") {
             lastAgentText = evt.item.text || "";
           }
-          // Capture token usage from turn.completed
           if (evt.type === "turn.completed" && evt.usage) {
             turnUsage = evt.usage;
           }
         } catch {
-          // non-JSON line, ignore
+          // non-JSON line
         }
       }
 
       const content = lastAgentText || stderr.trim() || "(no response)";
+      const rateLimited = code !== 0 && isRateLimitError(content + " " + stderr);
 
-      // Record token usage for stats tracking
       if (turnUsage) {
         recordUsage(model, turnUsage);
+        recordAccountUsage(acct, turnUsage);
         console.log(
-          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=${turnUsage.input_tokens}+${turnUsage.output_tokens} cached=${turnUsage.cached_input_tokens || 0} cost=$${calcCost(model, turnUsage).toFixed(6)}`
+          `[codex-gateway] account=${acct.label} model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=${turnUsage.input_tokens}+${turnUsage.output_tokens} cached=${turnUsage.cached_input_tokens || 0} cost=$${calcCost(model, turnUsage).toFixed(6)}`
         );
       } else {
         console.log(
-          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=unknown`
+          `[codex-gateway] account=${acct.label} model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=unknown`
         );
       }
 
       if (code === 0) {
-        resolve({ content, usage: turnUsage });
+        resolve({ content, usage: turnUsage, rateLimited: false });
         return;
       }
+
+      if (rateLimited) {
+        resolve({ content, usage: turnUsage, rateLimited: true });
+        return;
+      }
+
       if (code !== 0) usageStats.total_errors += 1;
       reject(new Error(content));
     });
   });
+}
+
+/**
+ * Run codex with automatic account rotation.
+ * Single account: direct passthrough, no rotation overhead.
+ * Multiple accounts: round-robin with rate-limit failover.
+ */
+async function runCodex(model, prompt, opts = {}) {
+  if (accountPool.length === 0) {
+    throw new Error("No accounts configured. Place auth.json or auth-{label}.json files in " + CODEX_HOME);
+  }
+
+  // Single account — simple passthrough, no rotation
+  if (!isMultiAccountMode()) {
+    return runCodexWithAccount(model, prompt, opts, accountPool[0]);
+  }
+
+  // Multi-account rotation
+  const maxAttempts = accountPool.length;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const acct = pickNextAccount();
+    if (!acct) break;
+
+    console.log(
+      `[codex-gateway] attempt ${attempt + 1}/${maxAttempts} using account=${acct.label}`
+    );
+
+    try {
+      const result = await runCodexWithAccount(model, prompt, opts, acct);
+
+      if (result.rateLimited) {
+        markAccountCooldown(acct);
+        lastError = new Error(`Account ${acct.label} rate-limited`);
+        console.warn(`[codex-gateway] account ${acct.label} hit rate limit, trying next...`);
+        continue;
+      }
+
+      return result;
+    } catch (err) {
+      if (isRateLimitError(err.message)) {
+        markAccountCooldown(acct);
+        lastError = err;
+        console.warn(`[codex-gateway] account ${acct.label} hit rate limit, trying next...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error("All accounts exhausted (rate-limited)");
 }
 
 // ---------------------------------------------------------------------------
@@ -757,21 +1073,20 @@ async function handleRequest(req, res) {
   }
 
   const url = req.url?.split("?")[0] ?? "/";
-
-  // Strip /v1 prefix so the server works whether mounted at / or /v1
   const route = url.startsWith("/v1") ? url.slice(3) : url;
 
-  // GET / or /help — machine & human readable usage info
+  // GET / or /help
   if (req.method === "GET" && (route === "/" || route === "/help")) {
     return json(res, 200, {
       name: "codex-gateway",
-      version: "1.1.0",
-      description: "OpenAI-compatible HTTP gateway wrapping the Codex CLI",
+      version: "2.0.0",
+      description: "OpenAI-compatible HTTP gateway wrapping the Codex CLI with multi-account rotation",
       endpoints: {
         "GET /v1/models": "List available models with context_window, supported_reasoning_levels",
-        "POST /v1/chat/completions": "Chat completion (OpenAI-compatible)",
-        "GET /v1/stats": "Today's token usage, budget, per-model breakdown, USD cost, and 7-day summary",
+        "POST /v1/chat/completions": "Chat completion (OpenAI-compatible, auto-rotates accounts)",
+        "GET /v1/stats": "Today's token usage, budget, per-model & per-account breakdown, USD cost",
         "GET /v1/stats/history": "Full daily history with grand totals (up to 90 days)",
+        "GET /v1/accounts": "Account pool status (plan, email, cooldown, per-account usage)",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
@@ -786,28 +1101,38 @@ async function handleRequest(req, res) {
         },
         max_tokens: { type: "integer", description: "Max output tokens" },
         max_completion_tokens: { type: "integer", description: "Alias for max_tokens" },
-        fast_mode: { type: "boolean", default: false, description: "Codex fast mode. Default off for higher quality. Set true to enable." },
+        fast_mode: { type: "boolean", default: false, description: "Codex fast mode. Default off for higher quality." },
       },
-      context_budget: {
-        model_context_window: 272000,
-        platform_reserved_percent: 5,
-        codex_system_overhead_tokens: "~3000",
-        effective_user_budget_tokens: "~254000",
+      account_rotation: {
+        strategy: "round-robin with automatic failover",
+        cooldown_ms: ACCOUNT_COOLDOWN_MS,
+        scan_interval_ms: ACCOUNT_SCAN_INTERVAL_MS,
+        total_accounts: accountPool.length,
+        accounts: accountPool.map((a) => a.label),
       },
       models_count: cachedModels.length,
-      account: accountInfo,
       config: { port: PORT, work_dir: WORK_DIR, codex_path: CODEX_PATH },
     });
   }
 
-  // GET /stats — today's usage statistics and budget info
+  // GET /stats
   if (req.method === "GET" && route === "/stats") {
     return json(res, 200, getStatsSnapshot());
   }
 
-  // GET /stats/history — full daily history with grand totals
+  // GET /stats/history
   if (req.method === "GET" && route === "/stats/history") {
     return json(res, 200, getFullHistory());
+  }
+
+  // GET /accounts — dedicated account pool status
+  if (req.method === "GET" && route === "/accounts") {
+    return json(res, 200, {
+      total: accountPool.length,
+      cooldown_ms: ACCOUNT_COOLDOWN_MS,
+      budget_per_account: DAILY_TOKEN_BUDGET,
+      accounts: getAccountPoolStatus(),
+    });
   }
 
   // GET /models
@@ -827,18 +1152,14 @@ async function handleRequest(req, res) {
     const includeUsage = Boolean(payload.stream_options?.include_usage);
     const payloadKeys = Object.keys(payload || {}).sort().join(",");
 
-    // Extract extra options from client request
     const runOpts = {};
-    // reasoning_effort: OpenAI-compatible field or custom header
     if (payload.reasoning_effort) runOpts.reasoning_effort = payload.reasoning_effort;
-    // max_tokens / max_completion_tokens
     if (payload.max_tokens) runOpts.max_tokens = payload.max_tokens;
     if (payload.max_completion_tokens) runOpts.max_tokens = payload.max_completion_tokens;
-    // fast_mode: explicit boolean toggle
     if (typeof payload.fast_mode === "boolean") runOpts.fast_mode = payload.fast_mode;
 
     console.log(
-      `[codex-gateway] -> model=${model} stream=${stream} messages=${payload.messages?.length ?? 0} keys=${payloadKeys}`
+      `[codex-gateway] -> model=${model} stream=${stream} messages=${payload.messages?.length ?? 0} accounts=${accountPool.length} keys=${payloadKeys}`
     );
 
     let result;
@@ -846,7 +1167,8 @@ async function handleRequest(req, res) {
       result = await runCodex(model, prompt, runOpts);
     } catch (err) {
       console.error(`[codex-gateway] codex error: ${err.message}`);
-      return json(res, 500, { error: { message: err.message, type: "server_error", code: "internal_server_error" } });
+      const statusCode = isRateLimitError(err.message) ? 429 : 500;
+      return json(res, statusCode, { error: { message: err.message, type: statusCode === 429 ? "rate_limit_error" : "server_error" } });
     }
 
     if (stream) {
@@ -863,18 +1185,41 @@ async function handleRequest(req, res) {
 // Startup
 // ---------------------------------------------------------------------------
 
+await discoverAndProvisionAccounts();
+updateLegacyAccountInfo();
 await refreshModels();
-await loadAccountInfo();
 await loadStats();
 watchModelCache();
 
-// Watch auth.json for token refreshes (plan info may change)
+// Watch for new auth files appearing in CODEX_HOME (best-effort, not all OS support this reliably)
 try {
-  fsWatch(AUTH_FILE, { persistent: false }, (event) => {
-    if (event === "change") loadAccountInfo();
+  fsWatch(CODEX_HOME, { persistent: false }, (event, filename) => {
+    if (filename && (filename === "auth.json" || /^auth-.+\.json$/.test(filename))) {
+      console.log(`[codex-gateway] auth file change detected: ${filename}, re-scanning accounts...`);
+      discoverAndProvisionAccounts().then(updateLegacyAccountInfo).catch(() => {});
+    }
   });
 } catch {}
 
+// Periodic scan: discover new accounts + sync updated auth files (only active in multi-account mode or to detect new accounts)
+setInterval(async () => {
+  try {
+    const prevCount = accountPool.length;
+    await discoverAndProvisionAccounts();
+    updateLegacyAccountInfo();
+    if (isMultiAccountMode()) {
+      await syncAccountAuthFiles();
+    }
+    if (accountPool.length !== prevCount) {
+      console.log(`[codex-gateway] account pool changed: ${prevCount} -> ${accountPool.length} [${accountPool.map((a) => a.label).join(", ")}]`);
+      if (isMultiAccountMode()) {
+        console.log(`[codex-gateway] multi-account rotation activated`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[codex-gateway] periodic account scan failed: ${err.message}`);
+  }
+}, ACCOUNT_SCAN_INTERVAL_MS);
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -889,5 +1234,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`[codex-gateway] listening on http://127.0.0.1:${PORT}`);
   console.log(`[codex-gateway] codex binary: ${CODEX_PATH}`);
   console.log(`[codex-gateway] work dir:     ${WORK_DIR}`);
-  console.log(`[codex-gateway] models cache: ${MODELS_CACHE_FILE}`);
+  console.log(`[codex-gateway] accounts:     ${accountPool.length} [${accountPool.map((a) => a.label).join(", ")}]`);
+  console.log(`[codex-gateway] mode:         ${isMultiAccountMode() ? "multi-account rotation" : "single account (direct)"}`);
+  console.log(`[codex-gateway] scan interval: ${ACCOUNT_SCAN_INTERVAL_MS / 1000}s`);
 });
