@@ -8,7 +8,8 @@ A zero-dependency, OpenAI-compatible HTTP gateway that wraps the [Codex CLI](htt
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/models` | List available Codex models (live from cache) |
+| `GET` | `/v1/help` | Usage info — parameters, context budget, config (machine & human readable) |
+| `GET` | `/v1/models` | List available Codex models with context_window and supported reasoning levels |
 | `POST` | `/v1/chat/completions` | Forward chat requests to the Codex CLI (streaming and non-streaming) |
 
 The API is OpenAI-compatible — any client that works with the OpenAI SDK will work with codex-gateway.
@@ -113,7 +114,9 @@ PORT=8400 CODEX_PATH=/usr/local/bin/codex node index.mjs
 | `ALL_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
 | `NO_PROXY` | — | Proxy bypass list |
 
-### Example request
+### Example requests
+
+Basic request:
 
 ```bash
 curl http://127.0.0.1:8319/v1/chat/completions \
@@ -123,6 +126,81 @@ curl http://127.0.0.1:8319/v1/chat/completions \
     "messages": [{"role": "user", "content": "Write a hello world in Go"}]
   }'
 ```
+
+With reasoning effort and max tokens:
+
+```bash
+curl http://127.0.0.1:8319/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [{"role": "user", "content": "Explain quantum computing"}],
+    "reasoning_effort": "high",
+    "max_tokens": 8000
+  }'
+```
+
+### Supported request parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `model` | string | Model slug (default: `gpt-5.4`) |
+| `messages` | array | OpenAI-format messages array |
+| `stream` | boolean | Enable SSE streaming (default: `false`) |
+| `reasoning_effort` | string | Reasoning depth: `low`, `medium`, `high`, `xhigh` (model-dependent, auto-validated) |
+| `max_tokens` | integer | Max output tokens (mapped to `model_max_output_tokens`) |
+| `max_completion_tokens` | integer | Alias for `max_tokens` |
+| `fast_mode` | boolean | Codex fast mode (default: `false`). Set `true` to enable for faster but lower quality responses. |
+
+> **Note:** Not all models support all reasoning levels. The gateway automatically validates and falls back to the highest supported level. Check `GET /v1/models` for per-model `supported_reasoning_levels`.
+
+### Model metadata
+
+`GET /v1/models` now returns extended metadata for each model:
+
+```json
+{
+  "id": "gpt-5.4",
+  "object": "model",
+  "context_window": 272000,
+  "effective_context_window_percent": 95,
+  "supported_reasoning_levels": ["low", "medium", "high", "xhigh"]
+}
+```
+
+**Context budget:** Each model has a 272k token context window. ~5% is reserved by the platform, and Codex CLI uses ~3k tokens for its system prompt and tool definitions. Effective user budget is approximately **254k tokens** per request.
+
+### Usage statistics and budget tracking
+
+`GET /v1/stats` returns today's token usage with budget warnings:
+
+```bash
+curl http://127.0.0.1:8319/v1/stats
+```
+
+```json
+{
+  "date": "2026-03-08",
+  "budget": {
+    "daily_limit": 10000000,
+    "total_used": 85200,
+    "remaining": 9914800,
+    "usage_percent": 0.85,
+    "status": "ok",
+    "warn_threshold_percent": 80
+  },
+  "tokens": { "input": 80000, "cached_input": 60000, "output": 5200 },
+  "requests": { "total": 12, "errors": 0 },
+  "by_model": { "gpt-5.4": { "input_tokens": 80000, "output_tokens": 5200, "requests": 12 } }
+}
+```
+
+- **Budget status**: `ok` → `warning` (at 80%) → `exceeded` (at 100%)
+- Resets automatically at midnight (UTC)
+- Stats persist across gateway restarts (saved to `~/.codex/gateway_stats.json`)
+- Configure via env: `DAILY_TOKEN_BUDGET` (default: 10M), `WARN_THRESHOLD` (default: 0.8)
+
+The gateway also returns **real token counts** in every chat completion response (`usage.prompt_tokens`, `usage.completion_tokens`, `usage.cached_tokens`).
 
 ### Use with any OpenAI-compatible client
 

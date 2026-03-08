@@ -36,6 +36,11 @@ const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const MODELS_CACHE_FILE = path.join(CODEX_HOME, "models_cache.json");
 const WORK_DIR = process.env.WORK_DIR || process.cwd();
 
+// Daily token budget (configurable via env, default 10M tokens — rough Codex Pro daily limit)
+const DAILY_TOKEN_BUDGET = parseInt(process.env.DAILY_TOKEN_BUDGET || "10000000", 10);
+// Warning threshold percentage
+const WARN_THRESHOLD = parseFloat(process.env.WARN_THRESHOLD || "0.8"); // 80%
+
 // Resolve the codex binary: CODEX_PATH env > same node_modules as the running
 // node > well-known paths > fallback to "codex" on PATH.
 function resolveCodexPath() {
@@ -53,20 +58,149 @@ const CODEX_PATH = resolveCodexPath();
 const NODE_PATH = process.execPath; // same node that launched us
 
 // ---------------------------------------------------------------------------
+// Usage statistics (resets daily)
+// ---------------------------------------------------------------------------
+
+const STATS_FILE = path.join(CODEX_HOME, "gateway_stats.json");
+
+const usageStats = {
+  date: todayStr(),
+  total_input_tokens: 0,
+  total_cached_input_tokens: 0,
+  total_output_tokens: 0,
+  total_requests: 0,
+  total_errors: 0,
+  by_model: {},        // { model: { input, cached_input, output, requests } }
+  started_at: new Date().toISOString(),
+};
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function ensureTodayStats() {
+  const today = todayStr();
+  if (usageStats.date !== today) {
+    // New day — reset
+    usageStats.date = today;
+    usageStats.total_input_tokens = 0;
+    usageStats.total_cached_input_tokens = 0;
+    usageStats.total_output_tokens = 0;
+    usageStats.total_requests = 0;
+    usageStats.total_errors = 0;
+    usageStats.by_model = {};
+    usageStats.started_at = new Date().toISOString();
+    console.log(`[codex-gateway] stats reset for new day: ${today}`);
+  }
+}
+
+function recordUsage(model, usage) {
+  ensureTodayStats();
+  const inp = usage.input_tokens || 0;
+  const cached = usage.cached_input_tokens || 0;
+  const out = usage.output_tokens || 0;
+
+  usageStats.total_input_tokens += inp;
+  usageStats.total_cached_input_tokens += cached;
+  usageStats.total_output_tokens += out;
+  usageStats.total_requests += 1;
+
+  if (!usageStats.by_model[model]) {
+    usageStats.by_model[model] = { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, requests: 0 };
+  }
+  const m = usageStats.by_model[model];
+  m.input_tokens += inp;
+  m.cached_input_tokens += cached;
+  m.output_tokens += out;
+  m.requests += 1;
+
+  // Persist async (best-effort)
+  fs.writeFile(STATS_FILE, JSON.stringify(usageStats, null, 2)).catch(() => {});
+
+  // Warn if approaching budget
+  const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
+  const pct = totalUsed / DAILY_TOKEN_BUDGET;
+  if (pct >= 1.0) {
+    console.warn(`[codex-gateway] ⚠️  BUDGET EXCEEDED: ${totalUsed.toLocaleString()} / ${DAILY_TOKEN_BUDGET.toLocaleString()} tokens (${(pct * 100).toFixed(1)}%)`);
+  } else if (pct >= WARN_THRESHOLD) {
+    console.warn(`[codex-gateway] ⚠️  Budget warning: ${totalUsed.toLocaleString()} / ${DAILY_TOKEN_BUDGET.toLocaleString()} tokens (${(pct * 100).toFixed(1)}%)`);
+  }
+}
+
+function getStatsSnapshot() {
+  ensureTodayStats();
+  const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
+  const pct = totalUsed / DAILY_TOKEN_BUDGET;
+  let status = "ok";
+  if (pct >= 1.0) status = "exceeded";
+  else if (pct >= WARN_THRESHOLD) status = "warning";
+
+  return {
+    date: usageStats.date,
+    budget: {
+      daily_limit: DAILY_TOKEN_BUDGET,
+      total_used: totalUsed,
+      remaining: Math.max(0, DAILY_TOKEN_BUDGET - totalUsed),
+      usage_percent: parseFloat((pct * 100).toFixed(2)),
+      status,
+      warn_threshold_percent: WARN_THRESHOLD * 100,
+    },
+    tokens: {
+      input: usageStats.total_input_tokens,
+      cached_input: usageStats.total_cached_input_tokens,
+      output: usageStats.total_output_tokens,
+    },
+    requests: {
+      total: usageStats.total_requests,
+      errors: usageStats.total_errors,
+    },
+    by_model: usageStats.by_model,
+    started_at: usageStats.started_at,
+  };
+}
+
+// Load stats from disk on startup (resume today's counts)
+async function loadStats() {
+  try {
+    const raw = await fs.readFile(STATS_FILE, "utf-8");
+    const saved = JSON.parse(raw);
+    if (saved.date === todayStr()) {
+      Object.assign(usageStats, saved);
+      const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
+      console.log(`[codex-gateway] resumed today's stats: ${totalUsed.toLocaleString()} tokens, ${usageStats.total_requests} requests`);
+    }
+  } catch {
+    // No stats file or different day — start fresh
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Model cache (auto-refreshed by watching models_cache.json)
 // ---------------------------------------------------------------------------
 
 const FALLBACK_MODELS = ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2", "gpt-5.1", "gpt-5"];
 
-let cachedModels = FALLBACK_MODELS.map(buildModelEntry);
+let cachedModels = FALLBACK_MODELS.map((s) => buildModelEntry(s));
 
-function buildModelEntry(slug, created) {
-  return {
+// Store full model metadata for context_window, reasoning levels, etc.
+let modelMetadata = new Map();
+
+function buildModelEntry(slug, created, meta) {
+  const entry = {
     id: slug,
     object: "model",
     created: created ?? Math.floor(Date.now() / 1000),
     owned_by: "openai",
   };
+  // Expose context_window and supported reasoning levels in model info
+  if (meta) {
+    entry.context_window = meta.context_window;
+    entry.effective_context_window_percent = meta.effective_context_window_percent;
+    if (meta.supported_reasoning_levels) {
+      entry.supported_reasoning_levels = meta.supported_reasoning_levels.map((l) => l.effort);
+    }
+  }
+  return entry;
 }
 
 async function refreshModels() {
@@ -75,11 +209,16 @@ async function refreshModels() {
     const data = JSON.parse(raw);
     if (!Array.isArray(data.models)) return;
     const ts = data.fetched_at ? Math.floor(new Date(data.fetched_at).getTime() / 1000) : Math.floor(Date.now() / 1000);
+    const newMeta = new Map();
     const models = data.models
       .filter((m) => m.visibility !== "hidden" && m.slug)
-      .map((m) => buildModelEntry(m.slug, ts));
+      .map((m) => {
+        newMeta.set(m.slug, m);
+        return buildModelEntry(m.slug, ts, m);
+      });
     if (models.length > 0) {
       cachedModels = models;
+      modelMetadata = newMeta;
       console.log(`[codex-gateway] models refreshed (${models.length}): ${models.map((m) => m.id).join(", ")}`);
     }
   } catch {
@@ -154,11 +293,52 @@ function messagesToPrompt(messages) {
 }
 
 /**
- * Run `codex exec` and return the assistant's last message.
+ * Resolve reasoning effort for a model.
+ * Priority: client request > auto-detect from model name.
+ * Validates against supported levels from model metadata.
  */
-async function runCodex(model, prompt) {
-  const tmpFile = path.join(os.tmpdir(), `cgw-${crypto.randomBytes(8).toString("hex")}.txt`);
-  const modelReasoningEffort = /mini/i.test(model) ? "high" : "xhigh";
+function resolveReasoningEffort(model, clientEffort) {
+  const meta = modelMetadata.get(model);
+  const supported = meta?.supported_reasoning_levels?.map((l) =>
+    typeof l === "string" ? l : l.effort
+  );
+
+  if (clientEffort && supported?.includes(clientEffort)) return clientEffort;
+  if (clientEffort && !supported) return clientEffort; // no metadata, trust client
+
+  // Default: mini → high, others → xhigh
+  const defaultEffort = /mini/i.test(model) ? "high" : "xhigh";
+  if (supported?.includes(defaultEffort)) return defaultEffort;
+  // Fallback to highest supported
+  if (supported?.length) return supported[supported.length - 1];
+  return defaultEffort;
+}
+
+/**
+ * Run `codex exec` and return the assistant's last message.
+ * @param {string} model - Model slug
+ * @param {string} prompt - Plain-text prompt
+ * @param {object} [opts] - Extra options from client request
+ * @param {string} [opts.reasoning_effort] - Reasoning effort level
+ * @param {number} [opts.max_tokens] - Max output tokens (mapped to model_max_output_tokens)
+ * @param {boolean} [opts.fast_mode] - Enable/disable fast mode (default: false)
+ */
+async function runCodex(model, prompt, opts = {}) {
+  const effort = resolveReasoningEffort(model, opts.reasoning_effort);
+
+  // Build config overrides
+  const configArgs = ["-c", `model_reasoning_effort=${effort}`];
+  if (opts.max_tokens && Number.isFinite(opts.max_tokens)) {
+    configArgs.push("-c", `model_max_output_tokens=${opts.max_tokens}`);
+  }
+
+  // Feature toggles — fast_mode defaults to OFF for higher quality
+  const featureArgs = [];
+  if (opts.fast_mode === true) {
+    featureArgs.push("--enable", "fast_mode");
+  } else {
+    featureArgs.push("--disable", "fast_mode");
+  }
 
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -168,10 +348,12 @@ async function runCodex(model, prompt) {
         "-a", "never",              // never ask for approval
         "-s", "workspace-write",    // minimal sandbox
         "exec",
+        "--ephemeral",              // no session persistence
         "--skip-git-repo-check",    // allow non-git work dirs (needed on Linux servers)
+        "--json",                   // JSONL output for precise token tracking
         "--model", model,
-        "-c", `model_reasoning_effort=${modelReasoningEffort}`,
-        "--output-last-message", tmpFile,
+        ...configArgs,
+        ...featureArgs,
         "-",                        // read prompt from stdin
       ],
       { cwd: WORK_DIR, env: buildSpawnEnv(), stdio: ["pipe", "pipe", "pipe"] }
@@ -188,20 +370,48 @@ async function runCodex(model, prompt) {
 
     child.on("error", reject);
 
-    child.on("close", async (code) => {
+    child.on("close", (code) => {
       const elapsed = Math.floor((Date.now() - started) / 1000);
-      let lastMsg = "";
-      try { lastMsg = (await fs.readFile(tmpFile, "utf-8")).trim(); } catch {}
-      try { await fs.unlink(tmpFile); } catch {}
 
-      const content = lastMsg || stdout.trim() || stderr.trim() || "(no response)";
-      console.log(
-        `[codex-gateway] model=${model} effort=${modelReasoningEffort} code=${code} elapsed=${elapsed}s len=${content.length}`
-      );
+      // Parse JSONL output from codex --json
+      let lastAgentText = "";
+      let turnUsage = null;
+      for (const line of stdout.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          // Capture the last agent_message text
+          if (evt.type === "item.completed" && evt.item?.type === "agent_message") {
+            lastAgentText = evt.item.text || "";
+          }
+          // Capture token usage from turn.completed
+          if (evt.type === "turn.completed" && evt.usage) {
+            turnUsage = evt.usage;
+          }
+        } catch {
+          // non-JSON line, ignore
+        }
+      }
+
+      const content = lastAgentText || stderr.trim() || "(no response)";
+
+      // Record token usage for stats tracking
+      if (turnUsage) {
+        recordUsage(model, turnUsage);
+        console.log(
+          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=${turnUsage.input_tokens}+${turnUsage.output_tokens} cached=${turnUsage.cached_input_tokens || 0}`
+        );
+      } else {
+        console.log(
+          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=unknown`
+        );
+      }
+
       if (code === 0) {
-        resolve(content);
+        resolve({ content, usage: turnUsage });
         return;
       }
+      if (code !== 0) usageStats.total_errors += 1;
       reject(new Error(content));
     });
   });
@@ -222,21 +432,36 @@ function json(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function createChatCompletionPayload(model, content) {
+function createChatCompletionPayload(model, content, turnUsage) {
+  const usage = turnUsage
+    ? {
+        prompt_tokens: turnUsage.input_tokens || 0,
+        completion_tokens: turnUsage.output_tokens || 0,
+        total_tokens: (turnUsage.input_tokens || 0) + (turnUsage.output_tokens || 0),
+        cached_tokens: turnUsage.cached_input_tokens || 0,
+      }
+    : { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 };
   return {
     id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-    usage: { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 },
+    usage,
   };
 }
 
-function sendChatCompletionStream(res, model, content, includeUsage = false) {
+function sendChatCompletionStream(res, model, content, includeUsage = false, turnUsage = null) {
   const id = `chatcmpl-${crypto.randomBytes(12).toString("hex")}`;
   const created = Math.floor(Date.now() / 1000);
-  const usage = { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 };
+  const usage = turnUsage
+    ? {
+        prompt_tokens: turnUsage.input_tokens || 0,
+        completion_tokens: turnUsage.output_tokens || 0,
+        total_tokens: (turnUsage.input_tokens || 0) + (turnUsage.output_tokens || 0),
+        cached_tokens: turnUsage.cached_input_tokens || 0,
+      }
+    : { prompt_tokens: -1, completion_tokens: -1, total_tokens: -1 };
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -320,6 +545,48 @@ async function handleRequest(req, res) {
   // Strip /v1 prefix so the server works whether mounted at / or /v1
   const route = url.startsWith("/v1") ? url.slice(3) : url;
 
+  // GET / or /help — machine & human readable usage info
+  if (req.method === "GET" && (route === "/" || route === "/help")) {
+    return json(res, 200, {
+      name: "codex-gateway",
+      version: "1.1.0",
+      description: "OpenAI-compatible HTTP gateway wrapping the Codex CLI",
+      endpoints: {
+        "GET /v1/models": "List available models with context_window, supported_reasoning_levels",
+        "POST /v1/chat/completions": "Chat completion (OpenAI-compatible)",
+        "GET /v1/stats": "Today's token usage, budget, per-model breakdown",
+        "GET /v1/help": "This help page",
+      },
+      request_parameters: {
+        model: { type: "string", default: "gpt-5.4", description: "Model slug" },
+        messages: { type: "array", required: true, description: "OpenAI-format messages [{role, content}]" },
+        stream: { type: "boolean", default: false, description: "Enable SSE streaming" },
+        reasoning_effort: {
+          type: "string",
+          values: ["low", "medium", "high", "xhigh"],
+          default: "xhigh (non-mini) / high (mini)",
+          description: "Reasoning depth. Auto-validated against model's supported levels.",
+        },
+        max_tokens: { type: "integer", description: "Max output tokens" },
+        max_completion_tokens: { type: "integer", description: "Alias for max_tokens" },
+        fast_mode: { type: "boolean", default: false, description: "Codex fast mode. Default off for higher quality. Set true to enable." },
+      },
+      context_budget: {
+        model_context_window: 272000,
+        platform_reserved_percent: 5,
+        codex_system_overhead_tokens: "~3000",
+        effective_user_budget_tokens: "~254000",
+      },
+      models_count: cachedModels.length,
+      config: { port: PORT, work_dir: WORK_DIR, codex_path: CODEX_PATH },
+    });
+  }
+
+  // GET /stats — today's usage statistics and budget info
+  if (req.method === "GET" && route === "/stats") {
+    return json(res, 200, getStatsSnapshot());
+  }
+
   // GET /models
   if (req.method === "GET" && route === "/models") {
     return json(res, 200, { object: "list", data: cachedModels });
@@ -337,23 +604,33 @@ async function handleRequest(req, res) {
     const includeUsage = Boolean(payload.stream_options?.include_usage);
     const payloadKeys = Object.keys(payload || {}).sort().join(",");
 
+    // Extract extra options from client request
+    const runOpts = {};
+    // reasoning_effort: OpenAI-compatible field or custom header
+    if (payload.reasoning_effort) runOpts.reasoning_effort = payload.reasoning_effort;
+    // max_tokens / max_completion_tokens
+    if (payload.max_tokens) runOpts.max_tokens = payload.max_tokens;
+    if (payload.max_completion_tokens) runOpts.max_tokens = payload.max_completion_tokens;
+    // fast_mode: explicit boolean toggle
+    if (typeof payload.fast_mode === "boolean") runOpts.fast_mode = payload.fast_mode;
+
     console.log(
       `[codex-gateway] -> model=${model} stream=${stream} messages=${payload.messages?.length ?? 0} keys=${payloadKeys}`
     );
 
-    let content;
+    let result;
     try {
-      content = await runCodex(model, prompt);
+      result = await runCodex(model, prompt, runOpts);
     } catch (err) {
       console.error(`[codex-gateway] codex error: ${err.message}`);
       return json(res, 500, { error: { message: err.message, type: "server_error", code: "internal_server_error" } });
     }
 
     if (stream) {
-      return sendChatCompletionStream(res, model, content, includeUsage);
+      return sendChatCompletionStream(res, model, result.content, includeUsage, result.usage);
     }
 
-    return json(res, 200, createChatCompletionPayload(model, content));
+    return json(res, 200, createChatCompletionPayload(model, result.content, result.usage));
   }
 
   return json(res, 404, { error: { message: `${req.method} ${req.url} not found`, type: "not_found" } });
@@ -364,6 +641,7 @@ async function handleRequest(req, res) {
 // ---------------------------------------------------------------------------
 
 await refreshModels();
+await loadStats();
 watchModelCache();
 
 const server = http.createServer(async (req, res) => {
