@@ -834,6 +834,8 @@ const RATE_LIMIT_PATTERNS = [
   /capacity/i,
   /usage.?limit/i,
   /exceeded.*limit/i,
+  /hit your.*limit/i,
+  /try again at/i,
 ];
 
 // Auth / account errors — account should be disabled, not just cooled down
@@ -919,6 +921,7 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
 
       let lastAgentText = "";
       let turnUsage = null;
+      let codexError = "";
       for (const line of stdout.split("\n")) {
         if (!line.trim()) continue;
         try {
@@ -929,13 +932,18 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
           if (evt.type === "turn.completed" && evt.usage) {
             turnUsage = evt.usage;
           }
+          // Capture error messages from codex JSONL output
+          if (evt.type === "error" || evt.type === "turn.failed") {
+            const msg = evt.message || evt.error?.message || "";
+            if (msg) codexError = msg;
+          }
         } catch {
           // non-JSON line
         }
       }
 
-      const content = lastAgentText || stderr.trim() || "(no response)";
-      const errorText = content + " " + stderr;
+      const content = lastAgentText || codexError || stderr.trim() || "(no response)";
+      const errorText = content + " " + stderr + " " + codexError;
       const rateLimited = code !== 0 && isRateLimitError(errorText);
       const authFailed = code !== 0 && isAuthError(errorText);
 
