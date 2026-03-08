@@ -207,6 +207,7 @@ curl http://127.0.0.1:8319/v1/stats
 }
 ```
 
+- **费用估算**：按 [OpenAI API 定价](https://openai.com/api/pricing/) 计算每次请求和每个模型的美元费用（注意：Codex Pro/Teams 订阅是固定月费，这里是 API 等价估算）
 - **预算状态**：`ok` → `warning`（达到 80%）→ `exceeded`（达到 100%）
 - 每天 UTC 午夜自动重置
 - 统计数据跨重启持久化（保存在 `~/.codex/gateway_stats.json`）

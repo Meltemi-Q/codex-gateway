@@ -195,6 +195,7 @@ curl http://127.0.0.1:8319/v1/stats
 }
 ```
 
+- **Estimated cost**: per-request and per-model USD cost based on [OpenAI API pricing](https://openai.com/api/pricing/) (note: Codex Pro/Teams subscriptions have flat monthly pricing, this is the API-equivalent estimate)
 - **Budget status**: `ok` → `warning` (at 80%) → `exceeded` (at 100%)
 - Resets automatically at midnight (UTC)
 - Stats persist across gateway restarts (saved to `~/.codex/gateway_stats.json`)

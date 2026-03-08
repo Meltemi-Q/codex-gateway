@@ -58,6 +58,41 @@ const CODEX_PATH = resolveCodexPath();
 const NODE_PATH = process.execPath; // same node that launched us
 
 // ---------------------------------------------------------------------------
+// Model pricing ($ per 1M tokens, source: openai.com/api/pricing 2026-03-05)
+// ---------------------------------------------------------------------------
+
+const MODEL_PRICING = {
+  // { input, cached_input, output } per 1M tokens
+  "gpt-5":                { input: 1.25,  cached: 0.125,  output: 10.00 },
+  "gpt-5-codex":          { input: 1.25,  cached: 0.125,  output: 10.00 },
+  "gpt-5-codex-mini":     { input: 0.25,  cached: 0.025,  output: 2.00  },
+  "gpt-5.1":              { input: 1.25,  cached: 0.125,  output: 10.00 },
+  "gpt-5.1-codex":        { input: 1.25,  cached: 0.125,  output: 10.00 },
+  "gpt-5.1-codex-max":    { input: 1.25,  cached: 0.125,  output: 10.00 },
+  "gpt-5.1-codex-mini":   { input: 0.25,  cached: 0.025,  output: 2.00  },
+  "gpt-5.2":              { input: 1.75,  cached: 0.175,  output: 14.00 },
+  "gpt-5.2-codex":        { input: 1.75,  cached: 0.175,  output: 14.00 },
+  "gpt-5.3-codex":        { input: 1.75,  cached: 0.175,  output: 14.00 },
+  "gpt-5.4":              { input: 1.75,  cached: 0.175,  output: 14.00 }, // same tier as 5.3
+};
+
+// Fallback pricing for unknown models (use gpt-5.1 tier as safe default)
+const DEFAULT_PRICING = { input: 1.25, cached: 0.125, output: 10.00 };
+
+function getModelPricing(model) {
+  return MODEL_PRICING[model] || DEFAULT_PRICING;
+}
+
+function calcCost(model, usage) {
+  if (!usage) return 0;
+  const p = getModelPricing(model);
+  const inputTokens = (usage.input_tokens || 0) - (usage.cached_input_tokens || 0);
+  const cachedTokens = usage.cached_input_tokens || 0;
+  const outputTokens = usage.output_tokens || 0;
+  return (inputTokens * p.input + cachedTokens * p.cached + outputTokens * p.output) / 1_000_000;
+}
+
+// ---------------------------------------------------------------------------
 // Usage statistics (resets daily)
 // ---------------------------------------------------------------------------
 
@@ -105,14 +140,17 @@ function recordUsage(model, usage) {
   usageStats.total_output_tokens += out;
   usageStats.total_requests += 1;
 
+  const cost = calcCost(model, usage);
+
   if (!usageStats.by_model[model]) {
-    usageStats.by_model[model] = { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, requests: 0 };
+    usageStats.by_model[model] = { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0, requests: 0, cost_usd: 0 };
   }
   const m = usageStats.by_model[model];
   m.input_tokens += inp;
   m.cached_input_tokens += cached;
   m.output_tokens += out;
   m.requests += 1;
+  m.cost_usd = parseFloat((m.cost_usd + cost).toFixed(6));
 
   // Persist async (best-effort)
   fs.writeFile(STATS_FILE, JSON.stringify(usageStats, null, 2)).catch(() => {});
@@ -135,6 +173,12 @@ function getStatsSnapshot() {
   if (pct >= 1.0) status = "exceeded";
   else if (pct >= WARN_THRESHOLD) status = "warning";
 
+  // Sum cost across all models
+  let totalCost = 0;
+  for (const m of Object.values(usageStats.by_model)) {
+    totalCost += m.cost_usd || 0;
+  }
+
   return {
     date: usageStats.date,
     budget: {
@@ -144,6 +188,10 @@ function getStatsSnapshot() {
       usage_percent: parseFloat((pct * 100).toFixed(2)),
       status,
       warn_threshold_percent: WARN_THRESHOLD * 100,
+    },
+    cost: {
+      total_usd: parseFloat(totalCost.toFixed(6)),
+      note: "Estimated API-equivalent cost based on openai.com/api/pricing. Codex Pro/Teams subscriptions have flat monthly pricing.",
     },
     tokens: {
       input: usageStats.total_input_tokens,
@@ -166,8 +214,20 @@ async function loadStats() {
     const saved = JSON.parse(raw);
     if (saved.date === todayStr()) {
       Object.assign(usageStats, saved);
+      // Backfill cost_usd for models loaded from old stats format
+      for (const [model, m] of Object.entries(usageStats.by_model)) {
+        if (m.cost_usd == null) {
+          m.cost_usd = calcCost(model, {
+            input_tokens: m.input_tokens,
+            cached_input_tokens: m.cached_input_tokens,
+            output_tokens: m.output_tokens,
+          });
+        }
+      }
       const totalUsed = usageStats.total_input_tokens + usageStats.total_output_tokens;
-      console.log(`[codex-gateway] resumed today's stats: ${totalUsed.toLocaleString()} tokens, ${usageStats.total_requests} requests`);
+      let totalCost = 0;
+      for (const m of Object.values(usageStats.by_model)) totalCost += m.cost_usd || 0;
+      console.log(`[codex-gateway] resumed today's stats: ${totalUsed.toLocaleString()} tokens, ${usageStats.total_requests} requests, $${totalCost.toFixed(4)}`);
     }
   } catch {
     // No stats file or different day — start fresh
@@ -399,7 +459,7 @@ async function runCodex(model, prompt, opts = {}) {
       if (turnUsage) {
         recordUsage(model, turnUsage);
         console.log(
-          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=${turnUsage.input_tokens}+${turnUsage.output_tokens} cached=${turnUsage.cached_input_tokens || 0}`
+          `[codex-gateway] model=${model} effort=${effort} code=${code} elapsed=${elapsed}s len=${content.length} tokens=${turnUsage.input_tokens}+${turnUsage.output_tokens} cached=${turnUsage.cached_input_tokens || 0} cost=$${calcCost(model, turnUsage).toFixed(6)}`
         );
       } else {
         console.log(
@@ -554,7 +614,7 @@ async function handleRequest(req, res) {
       endpoints: {
         "GET /v1/models": "List available models with context_window, supported_reasoning_levels",
         "POST /v1/chat/completions": "Chat completion (OpenAI-compatible)",
-        "GET /v1/stats": "Today's token usage, budget, per-model breakdown",
+        "GET /v1/stats": "Today's token usage, budget, per-model breakdown, and estimated USD cost",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
