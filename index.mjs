@@ -97,6 +97,8 @@ function calcCost(model, usage) {
 // ---------------------------------------------------------------------------
 
 const STATS_FILE = path.join(CODEX_HOME, "gateway_stats.json");
+const HISTORY_FILE = path.join(CODEX_HOME, "gateway_stats_history.json");
+const HISTORY_KEEP_DAYS = parseInt(process.env.HISTORY_KEEP_DAYS || "90", 10);
 
 const usageStats = {
   date: todayStr(),
@@ -105,27 +107,68 @@ const usageStats = {
   total_output_tokens: 0,
   total_requests: 0,
   total_errors: 0,
-  by_model: {},        // { model: { input, cached_input, output, requests } }
+  by_model: {},        // { model: { input, cached_input, output, requests, cost_usd } }
   started_at: new Date().toISOString(),
 };
+
+// Daily history: array of past day snapshots
+let statsHistory = [];
 
 function todayStr() {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Archive current day's stats to history, then reset for new day. */
+async function archiveAndReset(newDay) {
+  // Only archive if there were any requests
+  if (usageStats.total_requests > 0) {
+    // Build a compact summary for the archive
+    let totalCost = 0;
+    for (const m of Object.values(usageStats.by_model)) totalCost += m.cost_usd || 0;
+
+    const summary = {
+      date: usageStats.date,
+      tokens: {
+        input: usageStats.total_input_tokens,
+        cached_input: usageStats.total_cached_input_tokens,
+        output: usageStats.total_output_tokens,
+        total: usageStats.total_input_tokens + usageStats.total_output_tokens,
+      },
+      requests: usageStats.total_requests,
+      errors: usageStats.total_errors,
+      cost_usd: parseFloat(totalCost.toFixed(6)),
+      by_model: usageStats.by_model,
+    };
+
+    statsHistory.push(summary);
+
+    // Prune old entries beyond HISTORY_KEEP_DAYS
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - HISTORY_KEEP_DAYS);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    statsHistory = statsHistory.filter((s) => s.date >= cutoffStr);
+
+    // Persist history
+    await fs.writeFile(HISTORY_FILE, JSON.stringify(statsHistory, null, 2)).catch(() => {});
+    console.log(`[codex-gateway] archived ${usageStats.date}: ${usageStats.total_requests} reqs, $${totalCost.toFixed(4)}`);
+  }
+
+  // Reset for new day
+  usageStats.date = newDay;
+  usageStats.total_input_tokens = 0;
+  usageStats.total_cached_input_tokens = 0;
+  usageStats.total_output_tokens = 0;
+  usageStats.total_requests = 0;
+  usageStats.total_errors = 0;
+  usageStats.by_model = {};
+  usageStats.started_at = new Date().toISOString();
+  console.log(`[codex-gateway] stats reset for new day: ${newDay}`);
+}
+
 function ensureTodayStats() {
   const today = todayStr();
   if (usageStats.date !== today) {
-    // New day — reset
-    usageStats.date = today;
-    usageStats.total_input_tokens = 0;
-    usageStats.total_cached_input_tokens = 0;
-    usageStats.total_output_tokens = 0;
-    usageStats.total_requests = 0;
-    usageStats.total_errors = 0;
-    usageStats.by_model = {};
-    usageStats.started_at = new Date().toISOString();
-    console.log(`[codex-gateway] stats reset for new day: ${today}`);
+    archiveAndReset(today); // fire-and-forget (async but we don't await in hot path)
   }
 }
 
@@ -204,11 +247,81 @@ function getStatsSnapshot() {
     },
     by_model: usageStats.by_model,
     started_at: usageStats.started_at,
+    // Last 7 days summary for quick glance
+    recent_days: getRecentDaysSummary(7),
+  };
+}
+
+function getRecentDaysSummary(days) {
+  const recent = statsHistory.slice(-days);
+  if (recent.length === 0) return { days: 0, total_tokens: 0, total_cost_usd: 0, avg_daily_cost_usd: 0 };
+  let totalTokens = 0, totalCost = 0;
+  for (const d of recent) {
+    totalTokens += d.tokens?.total || 0;
+    totalCost += d.cost_usd || 0;
+  }
+  return {
+    days: recent.length,
+    total_tokens: totalTokens,
+    total_cost_usd: parseFloat(totalCost.toFixed(6)),
+    avg_daily_cost_usd: parseFloat((totalCost / recent.length).toFixed(6)),
+    entries: recent.map((d) => ({ date: d.date, requests: d.requests, tokens: d.tokens?.total || 0, cost_usd: d.cost_usd })),
+  };
+}
+
+function getFullHistory() {
+  // Include today as the last entry
+  ensureTodayStats();
+  let todayCost = 0;
+  for (const m of Object.values(usageStats.by_model)) todayCost += m.cost_usd || 0;
+
+  const todayEntry = {
+    date: usageStats.date,
+    requests: usageStats.total_requests,
+    tokens: usageStats.total_input_tokens + usageStats.total_output_tokens,
+    cost_usd: parseFloat(todayCost.toFixed(6)),
+    is_today: true,
+  };
+
+  const history = statsHistory.map((d) => ({
+    date: d.date,
+    requests: d.requests,
+    tokens: d.tokens?.total || 0,
+    cost_usd: d.cost_usd,
+  }));
+
+  // Grand totals
+  let grandTokens = todayEntry.tokens, grandCost = todayEntry.cost_usd, grandReqs = todayEntry.requests;
+  for (const d of history) {
+    grandTokens += d.tokens;
+    grandCost += d.cost_usd;
+    grandReqs += d.requests;
+  }
+
+  return {
+    total_days: history.length + 1,
+    grand_total: {
+      tokens: grandTokens,
+      cost_usd: parseFloat(grandCost.toFixed(6)),
+      requests: grandReqs,
+    },
+    days: [...history, todayEntry],
   };
 }
 
 // Load stats from disk on startup (resume today's counts)
 async function loadStats() {
+  // Load history
+  try {
+    const raw = await fs.readFile(HISTORY_FILE, "utf-8");
+    statsHistory = JSON.parse(raw);
+    if (!Array.isArray(statsHistory)) statsHistory = [];
+    console.log(`[codex-gateway] loaded ${statsHistory.length} days of history`);
+  } catch {
+    statsHistory = [];
+  }
+
+  // Load today's stats
   try {
     const raw = await fs.readFile(STATS_FILE, "utf-8");
     const saved = JSON.parse(raw);
@@ -228,9 +341,13 @@ async function loadStats() {
       let totalCost = 0;
       for (const m of Object.values(usageStats.by_model)) totalCost += m.cost_usd || 0;
       console.log(`[codex-gateway] resumed today's stats: ${totalUsed.toLocaleString()} tokens, ${usageStats.total_requests} requests, $${totalCost.toFixed(4)}`);
+    } else if (saved.date && saved.date !== todayStr() && saved.total_requests > 0) {
+      // Yesterday's stats not yet archived — archive now
+      Object.assign(usageStats, saved);
+      await archiveAndReset(todayStr());
     }
   } catch {
-    // No stats file or different day — start fresh
+    // No stats file — start fresh
   }
 }
 
@@ -614,7 +731,8 @@ async function handleRequest(req, res) {
       endpoints: {
         "GET /v1/models": "List available models with context_window, supported_reasoning_levels",
         "POST /v1/chat/completions": "Chat completion (OpenAI-compatible)",
-        "GET /v1/stats": "Today's token usage, budget, per-model breakdown, and estimated USD cost",
+        "GET /v1/stats": "Today's token usage, budget, per-model breakdown, USD cost, and 7-day summary",
+        "GET /v1/stats/history": "Full daily history with grand totals (up to 90 days)",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
@@ -645,6 +763,11 @@ async function handleRequest(req, res) {
   // GET /stats — today's usage statistics and budget info
   if (req.method === "GET" && route === "/stats") {
     return json(res, 200, getStatsSnapshot());
+  }
+
+  // GET /stats/history — full daily history with grand totals
+  if (req.method === "GET" && route === "/stats/history") {
+    return json(res, 200, getFullHistory());
   }
 
   // GET /models
