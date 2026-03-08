@@ -18,13 +18,18 @@
  *   GET  /v1/stats               → usage stats (global + per-account)
  *   GET  /v1/stats/history       → daily history
  *   GET  /v1/accounts            → account pool status
+ *   POST /v1/auth-sync           → manually trigger auth file sync to remote
  *
  * Config (environment variables):
  *   PORT              Server port (default: 8319)
+ *   BIND_ADDR         Bind address (default: 127.0.0.1, set to 0.0.0.0 for external access)
+ *   GATEWAY_API_KEY   API key for authentication (required when BIND_ADDR != 127.0.0.1)
  *   CODEX_PATH        Path to codex binary (auto-detected)
  *   CODEX_HOME        Codex data dir (default: ~/.codex)
  *   WORK_DIR          Working directory for codex CLI (default: cwd)
  *   ACCOUNT_COOLDOWN_MS  Cooldown after rate-limit per account (default: 300000 = 5 min)
+ *   AUTH_SYNC_TARGET  Remote scp target for auth file sync (e.g. "root@vps:~/.codex/")
+ *   AUTH_SYNC_SSH_OPTS  Extra ssh/scp options (e.g. "-i ~/.ssh/id_rsa")
  *   HTTPS_PROXY       Upstream proxy (forwarded to codex subprocess)
  *   HTTP_PROXY        Upstream proxy (forwarded to codex subprocess)
  *   ALL_PROXY         Upstream proxy (forwarded to codex subprocess)
@@ -44,6 +49,7 @@ import { existsSync } from "node:fs";
 // ---------------------------------------------------------------------------
 
 const PORT = parseInt(process.env.PORT || "8319", 10);
+const BIND_ADDR = process.env.BIND_ADDR || "127.0.0.1";
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const MODELS_CACHE_FILE = path.join(CODEX_HOME, "models_cache.json");
 const AUTH_FILE = path.join(CODEX_HOME, "auth.json");
@@ -52,9 +58,84 @@ const WORK_DIR = process.env.WORK_DIR || process.cwd();
 const ACCOUNT_COOLDOWN_MS = parseInt(process.env.ACCOUNT_COOLDOWN_MS || "300000", 10); // 5 min default
 const ACCOUNT_SCAN_INTERVAL_MS = parseInt(process.env.ACCOUNT_SCAN_INTERVAL_MS || "60000", 10); // rescan every 60s
 
+// API key authentication (required when BIND_ADDR is not 127.0.0.1)
+const API_KEY = process.env.GATEWAY_API_KEY || "";
+
+// Auth-sync: push local auth files to a remote gateway instance via scp
+// Set AUTH_SYNC_TARGET to enable, e.g. "root@vps:~/.codex/"
+const AUTH_SYNC_TARGET = process.env.AUTH_SYNC_TARGET || "";
+const AUTH_SYNC_SSH_OPTS = process.env.AUTH_SYNC_SSH_OPTS || ""; // e.g. "-i ~/.ssh/id_rsa" or "-o StrictHostKeyChecking=no"
+
 // Daily token budget per account (configurable via env, default 10M tokens)
 const DAILY_TOKEN_BUDGET = parseInt(process.env.DAILY_TOKEN_BUDGET || "10000000", 10);
 const WARN_THRESHOLD = parseFloat(process.env.WARN_THRESHOLD || "0.8"); // 80%
+
+// ---------------------------------------------------------------------------
+// API key authentication
+// ---------------------------------------------------------------------------
+
+function verifyApiKey(req) {
+  if (!API_KEY) return true; // no key configured = open access (local only)
+  const auth = req.headers["authorization"] || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7) === API_KEY;
+  if (auth === API_KEY) return true;
+  // Also check x-api-key header
+  return req.headers["x-api-key"] === API_KEY;
+}
+
+// ---------------------------------------------------------------------------
+// Auth-sync: push auth files to remote gateway via scp
+// ---------------------------------------------------------------------------
+
+let authSyncDebounce = null;
+
+async function syncAuthToRemote() {
+  if (!AUTH_SYNC_TARGET) return;
+
+  const files = [];
+  try {
+    const entries = await fs.readdir(CODEX_HOME);
+    for (const name of entries) {
+      if (name === "auth.json" || /^auth-.+\.json$/.test(name)) {
+        files.push(path.join(CODEX_HOME, name));
+      }
+    }
+  } catch { return; }
+
+  if (files.length === 0) return;
+
+  const sshOpts = AUTH_SYNC_SSH_OPTS ? AUTH_SYNC_SSH_OPTS.split(/\s+/) : [];
+  const scpArgs = [...sshOpts, ...files, AUTH_SYNC_TARGET];
+
+  console.log(`[auth-sync] pushing ${files.length} auth files to ${AUTH_SYNC_TARGET}`);
+
+  try {
+    const child = spawn("scp", scpArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    await new Promise((resolve, reject) => {
+      child.on("close", (code) => {
+        if (code === 0) {
+          console.log(`[auth-sync] pushed ${files.length} files OK`);
+          resolve();
+        } else {
+          console.error(`[auth-sync] scp failed (code=${code}): ${stderr.trim()}`);
+          reject(new Error(stderr));
+        }
+      });
+      child.on("error", reject);
+    });
+  } catch (err) {
+    console.error(`[auth-sync] error: ${err.message}`);
+  }
+}
+
+function triggerAuthSync() {
+  if (!AUTH_SYNC_TARGET) return;
+  clearTimeout(authSyncDebounce);
+  authSyncDebounce = setTimeout(() => syncAuthToRemote(), 2000); // debounce 2s
+}
 
 // ---------------------------------------------------------------------------
 // Multi-account pool
@@ -1167,6 +1248,11 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // API key authentication
+  if (!verifyApiKey(req)) {
+    return json(res, 401, { error: { message: "Invalid or missing API key", type: "authentication_error" } });
+  }
+
   const url = req.url?.split("?")[0] ?? "/";
   const route = url.startsWith("/v1") ? url.slice(3) : url;
 
@@ -1182,6 +1268,7 @@ async function handleRequest(req, res) {
         "GET /v1/stats": "Today's token usage, budget, per-model & per-account breakdown, USD cost",
         "GET /v1/stats/history": "Full daily history with grand totals (up to 90 days)",
         "GET /v1/accounts": "Account pool status (plan, email, cooldown, per-account usage)",
+        "POST /v1/auth-sync": "Manually trigger auth file sync to remote (requires AUTH_SYNC_TARGET)",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
@@ -1208,6 +1295,15 @@ async function handleRequest(req, res) {
       models_count: cachedModels.length,
       config: { port: PORT, work_dir: WORK_DIR, codex_path: CODEX_PATH },
     });
+  }
+
+  // POST /auth-sync — manually trigger auth file sync to remote
+  if (req.method === "POST" && route === "/auth-sync") {
+    if (!AUTH_SYNC_TARGET) {
+      return json(res, 400, { error: { message: "AUTH_SYNC_TARGET not configured", type: "config_error" } });
+    }
+    syncAuthToRemote().catch(() => {});
+    return json(res, 200, { status: "sync triggered", target: AUTH_SYNC_TARGET });
   }
 
   // GET /stats
@@ -1292,6 +1388,7 @@ try {
     if (filename && (filename === "auth.json" || /^auth-.+\.json$/.test(filename))) {
       console.log(`[codex-gateway] auth file change detected: ${filename}, re-scanning accounts...`);
       discoverAndProvisionAccounts().then(updateLegacyAccountInfo).catch(() => {});
+      triggerAuthSync();
     }
   });
 } catch {}
@@ -1325,11 +1422,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`[codex-gateway] listening on http://127.0.0.1:${PORT}`);
+server.listen(PORT, BIND_ADDR, () => {
+  console.log(`[codex-gateway] listening on http://${BIND_ADDR}:${PORT}`);
   console.log(`[codex-gateway] codex binary: ${CODEX_PATH}`);
   console.log(`[codex-gateway] work dir:     ${WORK_DIR}`);
   console.log(`[codex-gateway] accounts:     ${accountPool.length} [${accountPool.map((a) => a.label).join(", ")}]`);
   console.log(`[codex-gateway] mode:         ${isMultiAccountMode() ? "multi-account rotation" : "single account (direct)"}`);
   console.log(`[codex-gateway] scan interval: ${ACCOUNT_SCAN_INTERVAL_MS / 1000}s`);
+  console.log(`[codex-gateway] api key:      ${API_KEY ? "enabled" : "disabled (local only)"}`);
+  console.log(`[codex-gateway] auth-sync:    ${AUTH_SYNC_TARGET || "disabled"}`);
 });
+
+// Initial auth sync on startup (if configured)
+if (AUTH_SYNC_TARGET) {
+  syncAuthToRemote().catch(() => {});
+}
