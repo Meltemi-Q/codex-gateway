@@ -211,6 +211,19 @@ async function discoverAndProvisionAccounts() {
     console.error("[codex-gateway] no accounts found! Place auth.json or auth-{label}.json in " + CODEX_HOME);
   }
 
+  // Validate accounts: check JWT expiry and mark disabled
+  const now = Date.now();
+  for (const acct of pool) {
+    if (acct.info?.token_expires) {
+      const expiresMs = new Date(acct.info.token_expires).getTime();
+      if (expiresMs < now) {
+        acct.disabled = true;
+        acct.disabledReason = `JWT expired at ${acct.info.token_expires}`;
+        console.warn(`[codex-gateway] account ${acct.label} (${acct.info?.email}) DISABLED: JWT expired`);
+      }
+    }
+  }
+
   // De-duplicate by account_id (same account logged in twice)
   const seen = new Map();
   for (const acct of pool) {
@@ -239,6 +252,18 @@ async function discoverAndProvisionAccounts() {
     if (old) {
       acct.stats = old.stats;
       acct.cooldownUntil = old.cooldownUntil;
+      // Re-enable if the auth file was updated (new token), otherwise preserve disabled state
+      if (old.disabled) {
+        const oldExpiry = old.info?.token_expires ? new Date(old.info.token_expires).getTime() : 0;
+        const newExpiry = acct.info?.token_expires ? new Date(acct.info.token_expires).getTime() : 0;
+        if (newExpiry > oldExpiry) {
+          console.log(`[codex-gateway] account ${acct.label} re-enabled (new token detected)`);
+        } else {
+          acct.disabled = old.disabled;
+          acct.disabledReason = old.disabledReason;
+          acct.disabledAt = old.disabledAt;
+        }
+      }
     }
   }
 
@@ -277,29 +302,29 @@ async function syncAccountAuthFiles() {
 }
 
 function isMultiAccountMode() {
-  return accountPool.length > 1;
+  return accountPool.filter((a) => !a.disabled).length > 1;
 }
 
 function pickNextAccount() {
-  if (accountPool.length === 0) return null;
-  if (!isMultiAccountMode()) return accountPool[0];
+  const available = accountPool.filter((a) => !a.disabled);
+  if (available.length === 0) return null;
+  if (available.length === 1) return available[0];
 
   const now = Date.now();
-  const total = accountPool.length;
 
-  // Try round-robin, skipping cooled-down accounts
-  for (let i = 0; i < total; i++) {
-    const idx = (roundRobinIndex + i) % total;
-    const acct = accountPool[idx];
+  // Try round-robin, skipping cooled-down and disabled accounts
+  for (let i = 0; i < available.length; i++) {
+    const idx = (roundRobinIndex + i) % available.length;
+    const acct = available[idx];
     if (acct.cooldownUntil <= now) {
-      roundRobinIndex = (idx + 1) % total;
+      roundRobinIndex = (idx + 1) % available.length;
       return acct;
     }
   }
 
-  // All accounts are on cooldown — pick the one that expires soonest
-  let soonest = accountPool[0];
-  for (const acct of accountPool) {
+  // All available accounts are on cooldown — pick the one that expires soonest
+  let soonest = available[0];
+  for (const acct of available) {
     if (acct.cooldownUntil < soonest.cooldownUntil) soonest = acct;
   }
   console.warn(
@@ -308,11 +333,21 @@ function pickNextAccount() {
   return soonest;
 }
 
-function markAccountCooldown(acct) {
+function markAccountCooldown(acct, reason) {
   acct.cooldownUntil = Date.now() + ACCOUNT_COOLDOWN_MS;
   acct.stats.errors += 1;
   console.warn(
-    `[codex-gateway] account ${acct.label} rate-limited, cooldown until ${new Date(acct.cooldownUntil).toISOString()}`
+    `[codex-gateway] account ${acct.label} rate-limited, cooldown until ${new Date(acct.cooldownUntil).toISOString()} reason=${reason || "rate_limit"}`
+  );
+}
+
+function markAccountDisabled(acct, reason) {
+  acct.disabled = true;
+  acct.disabledReason = reason;
+  acct.disabledAt = new Date().toISOString();
+  acct.stats.errors += 1;
+  console.error(
+    `[codex-gateway] account ${acct.label} DISABLED: ${reason}`
   );
 }
 
@@ -331,12 +366,15 @@ function getAccountPoolStatus() {
     ensureAccountStatsToday(acct);
     const totalTokens = acct.stats.input_tokens + acct.stats.output_tokens;
     const pct = totalTokens / DAILY_TOKEN_BUDGET;
-    return {
+    let status = "available";
+    if (acct.disabled) status = "disabled";
+    else if (acct.cooldownUntil > now) status = "cooldown";
+    const entry = {
       label: acct.label,
       plan: acct.info?.plan || "unknown",
       email: acct.info?.email || null,
       token_expires: acct.info?.token_expires || null,
-      status: acct.cooldownUntil > now ? "cooldown" : "available",
+      status,
       cooldown_remaining_sec: acct.cooldownUntil > now ? Math.ceil((acct.cooldownUntil - now) / 1000) : 0,
       today: {
         requests: acct.stats.requests,
@@ -346,6 +384,11 @@ function getAccountPoolStatus() {
         budget: DAILY_TOKEN_BUDGET,
       },
     };
+    if (acct.disabled) {
+      entry.disabled_reason = acct.disabledReason;
+      entry.disabled_at = acct.disabledAt;
+    }
+    return entry;
   });
 }
 
@@ -793,8 +836,33 @@ const RATE_LIMIT_PATTERNS = [
   /exceeded.*limit/i,
 ];
 
+// Auth / account errors — account should be disabled, not just cooled down
+const AUTH_ERROR_PATTERNS = [
+  /refresh_token_reused/i,
+  /refresh.?token.*already.*used/i,
+  /please.*log\s*out.*sign\s*in/i,
+  /401\s*Unauthorized/i,
+  /invalid.*refresh.?token/i,
+  /token.*expired/i,
+  /authentication.*failed/i,
+  /could not be refreshed/i,
+  /sign\s*in\s*again/i,
+  /subscription.*expired/i,
+  /plan.*expired/i,
+  /account.*suspended/i,
+  /account.*disabled/i,
+];
+
 function isRateLimitError(errorText) {
   return RATE_LIMIT_PATTERNS.some((re) => re.test(errorText));
+}
+
+function isAuthError(errorText) {
+  return AUTH_ERROR_PATTERNS.some((re) => re.test(errorText));
+}
+
+function isRetryableError(errorText) {
+  return isRateLimitError(errorText) || isAuthError(errorText);
 }
 
 /**
@@ -867,7 +935,9 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
       }
 
       const content = lastAgentText || stderr.trim() || "(no response)";
-      const rateLimited = code !== 0 && isRateLimitError(content + " " + stderr);
+      const errorText = content + " " + stderr;
+      const rateLimited = code !== 0 && isRateLimitError(errorText);
+      const authFailed = code !== 0 && isAuthError(errorText);
 
       if (turnUsage) {
         recordUsage(model, turnUsage);
@@ -882,12 +952,17 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
       }
 
       if (code === 0) {
-        resolve({ content, usage: turnUsage, rateLimited: false });
+        resolve({ content, usage: turnUsage, rateLimited: false, authFailed: false });
+        return;
+      }
+
+      if (authFailed) {
+        resolve({ content, usage: turnUsage, rateLimited: false, authFailed: true });
         return;
       }
 
       if (rateLimited) {
-        resolve({ content, usage: turnUsage, rateLimited: true });
+        resolve({ content, usage: turnUsage, rateLimited: true, authFailed: false });
         return;
       }
 
@@ -913,7 +988,8 @@ async function runCodex(model, prompt, opts = {}) {
   }
 
   // Multi-account rotation
-  const maxAttempts = accountPool.length;
+  const available = accountPool.filter((a) => !a.disabled);
+  const maxAttempts = available.length;
   let lastError = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -927,8 +1003,15 @@ async function runCodex(model, prompt, opts = {}) {
     try {
       const result = await runCodexWithAccount(model, prompt, opts, acct);
 
+      if (result.authFailed) {
+        markAccountDisabled(acct, "auth failed: token expired or refresh_token reused — re-login required");
+        lastError = new Error(`Account ${acct.label} auth failed`);
+        console.warn(`[codex-gateway] account ${acct.label} auth failed, disabled, trying next...`);
+        continue;
+      }
+
       if (result.rateLimited) {
-        markAccountCooldown(acct);
+        markAccountCooldown(acct, "rate_limit");
         lastError = new Error(`Account ${acct.label} rate-limited`);
         console.warn(`[codex-gateway] account ${acct.label} hit rate limit, trying next...`);
         continue;
@@ -936,17 +1019,21 @@ async function runCodex(model, prompt, opts = {}) {
 
       return result;
     } catch (err) {
-      if (isRateLimitError(err.message)) {
-        markAccountCooldown(acct);
+      if (isAuthError(err.message)) {
+        markAccountDisabled(acct, err.message);
         lastError = err;
-        console.warn(`[codex-gateway] account ${acct.label} hit rate limit, trying next...`);
+        continue;
+      }
+      if (isRateLimitError(err.message)) {
+        markAccountCooldown(acct, "rate_limit");
+        lastError = err;
         continue;
       }
       throw err;
     }
   }
 
-  throw lastError || new Error("All accounts exhausted (rate-limited)");
+  throw lastError || new Error("All accounts exhausted (rate-limited or disabled)");
 }
 
 // ---------------------------------------------------------------------------
