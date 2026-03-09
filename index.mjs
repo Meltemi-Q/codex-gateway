@@ -955,7 +955,10 @@ function isRetryableError(errorText) {
 async function runCodexWithAccount(model, prompt, opts, acct) {
   const effort = resolveReasoningEffort(model, opts.reasoning_effort);
 
-  const configArgs = ["-c", `model_reasoning_effort=${effort}`];
+  const configArgs = [
+    "-c", `model_reasoning_effort=${effort}`,
+    "-c", "sandbox_workspace_write.network_access=true",
+  ];
   if (opts.max_tokens && Number.isFinite(opts.max_tokens)) {
     configArgs.push("-c", `model_max_output_tokens=${opts.max_tokens}`);
   }
