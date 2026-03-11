@@ -27,6 +27,7 @@
  *   CODEX_PATH        Path to codex binary (auto-detected)
  *   CODEX_HOME        Codex data dir (default: ~/.codex)
  *   WORK_DIR          Working directory for codex CLI (default: cwd)
+ *   CODEX_EXEC_TIMEOUT_MS  Kill a codex exec request after this many ms (default: 120000 = 120s)
  *   ACCOUNT_COOLDOWN_MS  Cooldown after rate-limit per account (default: 300000 = 5 min)
  *   AUTH_SYNC_TARGET  Remote scp target for auth file sync (e.g. "root@vps:~/.codex/")
  *   AUTH_SYNC_SSH_OPTS  Extra ssh/scp options (e.g. "-i ~/.ssh/id_rsa")
@@ -55,6 +56,15 @@ const MODELS_CACHE_FILE = path.join(CODEX_HOME, "models_cache.json");
 const AUTH_FILE = path.join(CODEX_HOME, "auth.json");
 const ACCOUNTS_DIR = path.join(CODEX_HOME, "accounts");
 const WORK_DIR = process.env.WORK_DIR || process.cwd();
+const DEFAULT_CODEX_EXEC_TIMEOUT_MS = 120000;
+const CODEX_EXEC_TIMEOUT_MS_RAW = parseInt(
+  process.env.CODEX_EXEC_TIMEOUT_MS || String(DEFAULT_CODEX_EXEC_TIMEOUT_MS),
+  10
+);
+const CODEX_EXEC_TIMEOUT_MS =
+  Number.isFinite(CODEX_EXEC_TIMEOUT_MS_RAW) && CODEX_EXEC_TIMEOUT_MS_RAW > 0
+    ? CODEX_EXEC_TIMEOUT_MS_RAW
+    : DEFAULT_CODEX_EXEC_TIMEOUT_MS;
 const ACCOUNT_COOLDOWN_MS = parseInt(process.env.ACCOUNT_COOLDOWN_MS || "300000", 10); // 5 min default
 const ACCOUNT_SCAN_INTERVAL_MS = parseInt(process.env.ACCOUNT_SCAN_INTERVAL_MS || "60000", 10); // rescan every 60s
 
@@ -948,6 +958,18 @@ function isRetryableError(errorText) {
   return isRateLimitError(errorText) || isAuthError(errorText);
 }
 
+function createTimeoutError(timeoutMs, elapsedSeconds, acctLabel, model) {
+  const seconds = Number.isFinite(timeoutMs) ? Math.ceil(timeoutMs / 1000) : "?";
+  const elapsed = Number.isFinite(elapsedSeconds) ? `${elapsedSeconds}s` : "?";
+  const err = new Error(
+    `Codex request timed out after ${seconds}s (account=${acctLabel}, model=${model}, elapsed=${elapsed})`
+  );
+  err.code = "ETIMEDOUT";
+  err.timeoutMs = timeoutMs;
+  err.elapsedSeconds = elapsedSeconds;
+  return err;
+}
+
 /**
  * Run `codex exec` using a specific account.
  * Returns { content, usage, rateLimited }
@@ -992,15 +1014,43 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
     let stdout = "";
     let stderr = "";
     const started = Date.now();
+    let timedOut = false;
+    let forceKilled = false;
+    let settled = false;
+
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
+    const killTimer = setTimeout(() => {
+      timedOut = true;
+      stderr += `\n[codex-gateway] request timed out after ${CODEX_EXEC_TIMEOUT_MS}ms`;
+      child.kill("SIGTERM");
+    }, CODEX_EXEC_TIMEOUT_MS);
+
+    const forceKillTimer = setTimeout(() => {
+      if (timedOut && child.exitCode === null) {
+        forceKilled = true;
+        child.kill("SIGKILL");
+      }
+    }, CODEX_EXEC_TIMEOUT_MS + 5000);
 
     child.stdin.write(prompt);
     child.stdin.end();
     child.stdout.on("data", (d) => { stdout += d.toString(); });
     child.stderr.on("data", (d) => { stderr += d.toString(); });
 
-    child.on("error", reject);
+    child.on("error", (err) => {
+      clearTimeout(killTimer);
+      clearTimeout(forceKillTimer);
+      settle(reject, err);
+    });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
+      clearTimeout(killTimer);
+      clearTimeout(forceKillTimer);
       const elapsed = Math.floor((Date.now() - started) / 1000);
 
       let lastAgentText = "";
@@ -1031,6 +1081,17 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
       const rateLimited = code !== 0 && isRateLimitError(errorText);
       const authFailed = code !== 0 && isAuthError(errorText);
 
+      if (timedOut) {
+        usageStats.total_errors += 1;
+        ensureAccountStatsToday(acct);
+        acct.stats.errors += 1;
+        console.error(
+          `[codex-gateway] account=${acct.label} model=${model} effort=${effort} timeout=${Math.ceil(CODEX_EXEC_TIMEOUT_MS / 1000)}s elapsed=${elapsed}s signal=${signal || "-"} force_kill=${forceKilled}`
+        );
+        settle(reject, createTimeoutError(CODEX_EXEC_TIMEOUT_MS, elapsed, acct.label, model));
+        return;
+      }
+
       if (turnUsage) {
         recordUsage(model, turnUsage);
         recordAccountUsage(acct, turnUsage);
@@ -1044,22 +1105,22 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
       }
 
       if (code === 0) {
-        resolve({ content, usage: turnUsage, rateLimited: false, authFailed: false });
+        settle(resolve, { content, usage: turnUsage, rateLimited: false, authFailed: false });
         return;
       }
 
       if (authFailed) {
-        resolve({ content, usage: turnUsage, rateLimited: false, authFailed: true });
+        settle(resolve, { content, usage: turnUsage, rateLimited: false, authFailed: true });
         return;
       }
 
       if (rateLimited) {
-        resolve({ content, usage: turnUsage, rateLimited: true, authFailed: false });
+        settle(resolve, { content, usage: turnUsage, rateLimited: true, authFailed: false });
         return;
       }
 
       if (code !== 0) usageStats.total_errors += 1;
-      reject(new Error(content));
+      settle(reject, new Error(content));
     });
   });
 }
@@ -1296,7 +1357,12 @@ async function handleRequest(req, res) {
         accounts: accountPool.map((a) => a.label),
       },
       models_count: cachedModels.length,
-      config: { port: PORT, work_dir: WORK_DIR, codex_path: CODEX_PATH },
+      config: {
+        port: PORT,
+        work_dir: WORK_DIR,
+        codex_path: CODEX_PATH,
+        codex_exec_timeout_ms: CODEX_EXEC_TIMEOUT_MS,
+      },
     });
   }
 
@@ -1361,8 +1427,10 @@ async function handleRequest(req, res) {
       result = await runCodex(model, prompt, runOpts);
     } catch (err) {
       console.error(`[codex-gateway] codex error: ${err.message}`);
-      const statusCode = isRateLimitError(err.message) ? 429 : 500;
-      return json(res, statusCode, { error: { message: err.message, type: statusCode === 429 ? "rate_limit_error" : "server_error" } });
+      const statusCode = err.code === "ETIMEDOUT" ? 504 : isRateLimitError(err.message) ? 429 : 500;
+      const errorType =
+        statusCode === 504 ? "timeout_error" : statusCode === 429 ? "rate_limit_error" : "server_error";
+      return json(res, statusCode, { error: { message: err.message, type: errorType } });
     }
 
     if (stream) {
@@ -1429,6 +1497,7 @@ server.listen(PORT, BIND_ADDR, () => {
   console.log(`[codex-gateway] listening on http://${BIND_ADDR}:${PORT}`);
   console.log(`[codex-gateway] codex binary: ${CODEX_PATH}`);
   console.log(`[codex-gateway] work dir:     ${WORK_DIR}`);
+  console.log(`[codex-gateway] exec timeout: ${Math.ceil(CODEX_EXEC_TIMEOUT_MS / 1000)}s`);
   console.log(`[codex-gateway] accounts:     ${accountPool.length} [${accountPool.map((a) => a.label).join(", ")}]`);
   console.log(`[codex-gateway] mode:         ${isMultiAccountMode() ? "multi-account rotation" : "single account (direct)"}`);
   console.log(`[codex-gateway] scan interval: ${ACCOUNT_SCAN_INTERVAL_MS / 1000}s`);

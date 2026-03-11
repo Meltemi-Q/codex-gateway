@@ -109,6 +109,7 @@ PORT=8400 CODEX_PATH=/usr/local/bin/codex node index.mjs
 | `CODEX_PATH` | auto-detected | Path to the `codex` binary |
 | `CODEX_HOME` | `~/.codex` | Codex data directory (contains auth and model cache) |
 | `WORK_DIR` | `process.cwd()` | Working directory passed to `codex exec` |
+| `CODEX_EXEC_TIMEOUT_MS` | `120000` | Kill a `codex exec` request after this many milliseconds and return HTTP 504 |
 | `HTTPS_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
 | `HTTP_PROXY` | — | Upstream proxy forwarded to the codex subprocess |
 | `ALL_PROXY` | — | Upstream proxy forwarded to the codex subprocess |

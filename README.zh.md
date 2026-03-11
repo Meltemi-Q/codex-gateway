@@ -119,6 +119,7 @@ PORT=8400 CODEX_PATH=/usr/local/bin/codex node index.mjs
 | `CODEX_PATH` | 自动检测 | codex 二进制路径 |
 | `CODEX_HOME` | `~/.codex` | Codex 数据目录 |
 | `WORK_DIR` | 当前目录 | 传给 `codex exec` 的工作目录 |
+| `CODEX_EXEC_TIMEOUT_MS` | `120000` | 单次 `codex exec` 超时毫秒数；超时后会杀掉子进程并返回 HTTP 504 |
 | `HTTPS_PROXY` | — | 上游代理，转发给 codex 子进程 |
 | `HTTP_PROXY` | — | 上游代理 |
 | `ALL_PROXY` | — | 上游代理（socks5） |
