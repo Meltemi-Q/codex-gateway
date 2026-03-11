@@ -31,9 +31,9 @@ Usage:
   node scripts/install-droid-models.mjs [--base-url URL] [--api-key KEY] [--provider NAME] [--set-default] [--no-backup]
 
 Options:
-  --base-url URL   Droid baseUrl to write (default: ${DEFAULT_BASE_URL})
-  --api-key KEY    Droid apiKey to write (default: ${DEFAULT_API_KEY})
-  --provider NAME  Droid provider to write (default: ${DEFAULT_PROVIDER})
+  --base-url URL   Droid baseUrl to write (default: env DROID_BASE_URL or ${DEFAULT_BASE_URL})
+  --api-key KEY    Droid apiKey to write (default: env DROID_API_KEY or ${DEFAULT_API_KEY})
+  --provider NAME  Droid provider to write (default: env DROID_PROVIDER or ${DEFAULT_PROVIDER})
   --set-default    Set Droid's default session model to the imported GPT-5.4 entry
   --no-backup      Skip writing .bak files before updating config
   --help           Show this help
@@ -42,9 +42,9 @@ Options:
 
 function parseArgs(argv) {
   const options = {
-    baseUrl: DEFAULT_BASE_URL,
-    apiKey: DEFAULT_API_KEY,
-    provider: DEFAULT_PROVIDER,
+    baseUrl: process.env.DROID_BASE_URL || DEFAULT_BASE_URL,
+    apiKey: process.env.DROID_API_KEY || DEFAULT_API_KEY,
+    provider: process.env.DROID_PROVIDER || DEFAULT_PROVIDER,
     backup: true,
     setDefault: false,
     factoryHome: path.join(os.homedir(), ".factory"),

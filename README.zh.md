@@ -247,6 +247,23 @@ npm run sync:droid -- --set-default
 npm run sync:droid -- --base-url http://127.0.0.1:8400/v1
 ```
 
+如果 Droid 在 **Mac** 上，而网关跑在 **VPS** 上，可以直接在 Mac 上运行这个远程同步脚本。它会通过 SSH 到 VPS 读取网关 key，再写入本机 `~/.factory/config.json` 和 `~/.factory/settings.json`，不用手抄 key：
+
+```bash
+ssh root@100.74.249.26 'cat /root/codex-gateway/scripts/sync-droid-remote-from-vps.sh' | bash
+```
+
+常见场景：
+
+```bash
+# 改成走 VPS 上的 Tailscale 地址，并设为默认模型
+ssh root@100.74.249.26 'cat /root/codex-gateway/scripts/sync-droid-remote-from-vps.sh' | bash
+
+# 不改默认模型，只导入模型列表
+ssh root@100.74.249.26 'cat /root/codex-gateway/scripts/sync-droid-remote-from-vps.sh' | \
+  bash -s -- --no-set-default
+```
+
 导入脚本会：
 - 使用 `provider: "generic-chat-completion-api"` 写入 Droid 模型
 - 在覆盖前自动生成 `config.json.bak` 和 `settings.json.bak`
