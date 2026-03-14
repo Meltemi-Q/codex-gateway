@@ -432,13 +432,14 @@ function markAccountCooldown(acct, reason) {
   );
 }
 
-function markAccountDisabled(acct, reason) {
+function markAccountDisabled(acct, reason, errorCategory) {
   acct.disabled = true;
   acct.disabledReason = reason;
   acct.disabledAt = new Date().toISOString();
+  acct.errorCategory = errorCategory || classifyError(reason);
   acct.stats.errors += 1;
   console.error(
-    `[codex-gateway] account ${acct.label} DISABLED: ${reason}`
+    `[codex-gateway] account ${acct.label} DISABLED: category=${acct.errorCategory} reason=${reason}`
   );
 }
 
@@ -478,9 +479,26 @@ function getAccountPoolStatus() {
     if (acct.disabled) {
       entry.disabled_reason = acct.disabledReason;
       entry.disabled_at = acct.disabledAt;
+      entry.error_category = acct.errorCategory || "unknown";
     }
     return entry;
   });
+}
+
+function getProviderReadiness() {
+  const healthyCount = accountPool.filter(a => !a.disabled && a.cooldownUntil <= Date.now()).length;
+  const totalCount = accountPool.length;
+  let status;
+  if (healthyCount === 0) status = "down";
+  else if (healthyCount === 1) status = "degraded";
+  else status = "healthy";
+  return {
+    status,
+    healthy_accounts: healthyCount,
+    total_accounts: totalCount,
+    disabled_accounts: accountPool.filter(a => a.disabled).length,
+    cooldown_accounts: accountPool.filter(a => !a.disabled && a.cooldownUntil > Date.now()).length,
+  };
 }
 
 // Backward-compat: expose the active account info as the legacy accountInfo
@@ -946,6 +964,42 @@ const AUTH_ERROR_PATTERNS = [
   /account.*disabled/i,
 ];
 
+// Workspace / billing errors — account should be disabled with specific reason
+const WORKSPACE_ERROR_PATTERNS = [
+  /deactivated_workspace/i,
+  /workspace.*deactivated/i,
+  /workspace.*suspended/i,
+  /workspace.*disabled/i,
+];
+
+const BILLING_ERROR_PATTERNS = [
+  /insufficient_balance/i,
+  /insufficient.*balance/i,
+  /billing.*error/i,
+  /payment.*failed/i,
+  /payment.*required/i,
+  /overdue/i,
+  /past.?due/i,
+];
+
+function classifyError(errorText) {
+  if (!errorText) return "unknown";
+  if (WORKSPACE_ERROR_PATTERNS.some(re => re.test(errorText))) return "deactivated_workspace";
+  if (BILLING_ERROR_PATTERNS.some(re => re.test(errorText))) return "insufficient_balance";
+  if (AUTH_ERROR_PATTERNS.some(re => re.test(errorText))) return "auth_invalid";
+  if (RATE_LIMIT_PATTERNS.some(re => re.test(errorText))) return "rate_limit";
+  if (/timed?s*out|ETIMEDOUT/i.test(errorText)) return "timeout";
+  return "unknown";
+}
+
+function isWorkspaceError(errorText) {
+  return WORKSPACE_ERROR_PATTERNS.some(re => re.test(errorText));
+}
+
+function isBillingError(errorText) {
+  return BILLING_ERROR_PATTERNS.some(re => re.test(errorText));
+}
+
 function isRateLimitError(errorText) {
   return RATE_LIMIT_PATTERNS.some((re) => re.test(errorText));
 }
@@ -1080,6 +1134,8 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
       const errorText = content + " " + stderr + " " + codexError;
       const rateLimited = code !== 0 && isRateLimitError(errorText);
       const authFailed = code !== 0 && isAuthError(errorText);
+      const workspaceFailed = code !== 0 && isWorkspaceError(errorText);
+      const billingFailed = code !== 0 && isBillingError(errorText);
 
       if (timedOut) {
         usageStats.total_errors += 1;
@@ -1106,6 +1162,16 @@ async function runCodexWithAccount(model, prompt, opts, acct) {
 
       if (code === 0) {
         settle(resolve, { content, usage: turnUsage, rateLimited: false, authFailed: false });
+        return;
+      }
+
+      if (workspaceFailed) {
+        settle(resolve, { content, usage: turnUsage, rateLimited: false, authFailed: false, workspaceFailed: true });
+        return;
+      }
+
+      if (billingFailed) {
+        settle(resolve, { content, usage: turnUsage, rateLimited: false, authFailed: false, billingFailed: true });
         return;
       }
 
@@ -1156,8 +1222,22 @@ async function runCodex(model, prompt, opts = {}) {
     try {
       const result = await runCodexWithAccount(model, prompt, opts, acct);
 
+      if (result.workspaceFailed) {
+        markAccountDisabled(acct, "workspace deactivated", "deactivated_workspace");
+        lastError = new Error(`Account ${acct.label} workspace deactivated`);
+        console.warn(`[codex-gateway] account ${acct.label} workspace deactivated, disabled, trying next...`);
+        continue;
+      }
+
+      if (result.billingFailed) {
+        markAccountDisabled(acct, "insufficient balance or billing error", "insufficient_balance");
+        lastError = new Error(`Account ${acct.label} billing failed`);
+        console.warn(`[codex-gateway] account ${acct.label} billing failed, disabled, trying next...`);
+        continue;
+      }
+
       if (result.authFailed) {
-        markAccountDisabled(acct, "auth failed: token expired or refresh_token reused — re-login required");
+        markAccountDisabled(acct, "auth failed: token expired or refresh_token reused — re-login required", "auth_invalid");
         lastError = new Error(`Account ${acct.label} auth failed`);
         console.warn(`[codex-gateway] account ${acct.label} auth failed, disabled, trying next...`);
         continue;
@@ -1172,8 +1252,18 @@ async function runCodex(model, prompt, opts = {}) {
 
       return result;
     } catch (err) {
+      if (isWorkspaceError(err.message)) {
+        markAccountDisabled(acct, err.message, "deactivated_workspace");
+        lastError = err;
+        continue;
+      }
+      if (isBillingError(err.message)) {
+        markAccountDisabled(acct, err.message, "insufficient_balance");
+        lastError = err;
+        continue;
+      }
       if (isAuthError(err.message)) {
-        markAccountDisabled(acct, err.message);
+        markAccountDisabled(acct, err.message, "auth_invalid");
         lastError = err;
         continue;
       }
@@ -1320,6 +1410,28 @@ async function handleRequest(req, res) {
   const url = req.url?.split("?")[0] ?? "/";
   const route = url.startsWith("/v1") ? url.slice(3) : url;
 
+  // GET /health — provider-level health for upstream consumers
+  if (req.method === "GET" && route === "/health") {
+    const readiness = getProviderReadiness();
+    const statusCode = readiness.status === "down" ? 503 : 200;
+    return json(res, statusCode, {
+      service: "codex-gateway",
+      ...readiness,
+      models_count: cachedModels.length,
+      uptime_sec: Math.floor((Date.now() - server._startedAt) / 1000),
+    });
+  }
+
+  // GET /routing-status — eligible models and routing info
+  if (req.method === "GET" && route === "/routing-status") {
+    const readiness = getProviderReadiness();
+    return json(res, 200, {
+      provider: readiness,
+      eligible_models: readiness.status !== "down" ? cachedModels.map(m => m.id) : [],
+      accounts: getAccountPoolStatus(),
+    });
+  }
+
   // GET / or /help
   if (req.method === "GET" && (route === "/" || route === "/help")) {
     return json(res, 200, {
@@ -1333,6 +1445,8 @@ async function handleRequest(req, res) {
         "GET /v1/stats/history": "Full daily history with grand totals (up to 90 days)",
         "GET /v1/accounts": "Account pool status (plan, email, cooldown, per-account usage)",
         "POST /v1/auth-sync": "Manually trigger auth file sync to remote (requires AUTH_SYNC_TARGET)",
+        "GET /v1/health": "Provider-level health (healthy/degraded/down) for upstream routing",
+        "GET /v1/routing-status": "Eligible models and account routing state",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
@@ -1493,6 +1607,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server._startedAt = Date.now();
 server.listen(PORT, BIND_ADDR, () => {
   console.log(`[codex-gateway] listening on http://${BIND_ADDR}:${PORT}`);
   console.log(`[codex-gateway] codex binary: ${CODEX_PATH}`);
