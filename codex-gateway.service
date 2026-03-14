@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex Gateway (OpenAI-compatible multi-account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/codex-gateway
+ExecStart=/usr/bin/node /root/codex-gateway/index.mjs
+Restart=always
+RestartSec=5
+Environment=HOME=/root
+Environment=PORT=8319
+Environment=BIND_ADDR=127.0.0.1
+Environment=PATH=/root/.local/bin:/root/.npm-global/bin:/root/.volta/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
