@@ -433,13 +433,51 @@ function markAccountCooldown(acct, reason) {
 }
 
 function markAccountDisabled(acct, reason, errorCategory) {
+  const category = errorCategory || classifyError(reason);
+  const recoverability = errorRecoverability(category);
+
+  // For refreshable errors: don't disable on first occurrence, try reprobe first
+  if (recoverability === "refreshable" && !acct._reprobeAttempted) {
+    acct._reprobeAttempted = true;
+    acct.cooldownUntil = Date.now() + ACCOUNT_COOLDOWN_MS;
+    acct.stats.errors += 1;
+    console.warn(
+      `[codex-gateway] account ${acct.label} refreshable error (category=${category}), cooldown + pending reprobe instead of immediate disable`
+    );
+    // Schedule async reprobe
+    setTimeout(() => {
+      refreshAccountRateLimits(acct, { force: true })
+        .then(() => {
+          acct._reprobeAttempted = false;
+          console.log(`[codex-gateway] account ${acct.label} reprobe succeeded, keeping active`);
+        })
+        .catch((err) => {
+          // Reprobe failed — now actually disable
+          acct.disabled = true;
+          acct.disabledReason = reason;
+          acct.disabledAt = new Date().toISOString();
+          acct.errorCategory = category;
+          console.error(`[codex-gateway] account ${acct.label} reprobe failed, now DISABLED: ${err.message}`);
+        });
+    }, 5000);
+    return;
+  }
+
+  // For cooldown-only: never disable, just cooldown
+  if (recoverability === "cooldown-only") {
+    markAccountCooldown(acct, reason);
+    return;
+  }
+
+  // Non-refreshable or reprobe already attempted: disable
   acct.disabled = true;
   acct.disabledReason = reason;
   acct.disabledAt = new Date().toISOString();
-  acct.errorCategory = errorCategory || classifyError(reason);
+  acct.errorCategory = category;
+  acct._reprobeAttempted = false;
   acct.stats.errors += 1;
   console.error(
-    `[codex-gateway] account ${acct.label} DISABLED: category=${acct.errorCategory} reason=${reason}`
+    `[codex-gateway] account ${acct.label} DISABLED: category=${category} recoverability=${recoverability} reason=${reason}`
   );
 }
 
@@ -480,24 +518,35 @@ function getAccountPoolStatus() {
       entry.disabled_reason = acct.disabledReason;
       entry.disabled_at = acct.disabledAt;
       entry.error_category = acct.errorCategory || "unknown";
+      entry.recoverability = errorRecoverability(acct.errorCategory || "unknown");
     }
+    const expiry = getTokenExpiryWarning(acct);
+    entry.token_expiry = expiry;
     return entry;
   });
 }
 
 function getProviderReadiness() {
-  const healthyCount = accountPool.filter(a => !a.disabled && a.cooldownUntil <= Date.now()).length;
+  const now = Date.now();
+  const healthyCount = accountPool.filter(a => !a.disabled && a.cooldownUntil <= now).length;
   const totalCount = accountPool.length;
   let status;
   if (healthyCount === 0) status = "down";
   else if (healthyCount === 1) status = "degraded";
   else status = "healthy";
+
+  // Expiry warnings
+  const expiringAccounts = accountPool
+    .map(a => ({ label: a.label, ...getTokenExpiryWarning(a) }))
+    .filter(e => e.warning_level !== "ok" && e.warning_level !== "unknown");
+
   return {
     status,
     healthy_accounts: healthyCount,
     total_accounts: totalCount,
     disabled_accounts: accountPool.filter(a => a.disabled).length,
-    cooldown_accounts: accountPool.filter(a => !a.disabled && a.cooldownUntil > Date.now()).length,
+    cooldown_accounts: accountPool.filter(a => !a.disabled && a.cooldownUntil > now).length,
+    expiring_accounts: expiringAccounts.length > 0 ? expiringAccounts : undefined,
   };
 }
 
@@ -998,6 +1047,30 @@ function isWorkspaceError(errorText) {
 
 function isBillingError(errorText) {
   return BILLING_ERROR_PATTERNS.some(re => re.test(errorText));
+}
+
+// Error recoverability classification
+const REFRESHABLE_CATEGORIES = new Set(["auth_invalid", "timeout"]);
+const COOLDOWN_ONLY_CATEGORIES = new Set(["rate_limit"]);
+// Everything else (deactivated_workspace, insufficient_balance) is non-refreshable
+
+function errorRecoverability(category) {
+  if (REFRESHABLE_CATEGORIES.has(category)) return "refreshable";
+  if (COOLDOWN_ONLY_CATEGORIES.has(category)) return "cooldown-only";
+  return "non-refreshable";
+}
+
+function getTokenExpiryWarning(acct) {
+  if (!acct.info?.token_expires) return { expires_in_sec: null, warning_level: "unknown" };
+  const expiresMs = new Date(acct.info.token_expires).getTime();
+  const nowMs = Date.now();
+  const diffSec = Math.floor((expiresMs - nowMs) / 1000);
+  let warning_level = "ok";
+  if (diffSec <= 0) warning_level = "expired";
+  else if (diffSec <= 86400) warning_level = "critical_24h";
+  else if (diffSec <= 259200) warning_level = "warning_3d";
+  else if (diffSec <= 604800) warning_level = "notice_7d";
+  return { expires_in_sec: diffSec, warning_level };
 }
 
 function isRateLimitError(errorText) {
