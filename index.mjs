@@ -1349,6 +1349,21 @@ async function runCodex(model, prompt, opts = {}) {
     }
   }
 
+  // Distinguish all-cooldown (temporary) from all-disabled (permanent)
+  const now2 = Date.now();
+  const disabledCount = accountPool.filter(a => a.disabled).length;
+  const cooldownCount = accountPool.filter(a => !a.disabled && a.cooldownUntil > now2).length;
+  const totalCount = accountPool.length;
+  if (disabledCount === totalCount) {
+    const err = new Error("All accounts permanently unavailable (disabled). Re-login or add new accounts.");
+    err.exhaustionType = "all_disabled";
+    throw err;
+  }
+  if (cooldownCount + disabledCount >= totalCount) {
+    const err = new Error("All accounts temporarily rate-limited. Try again in a few minutes.");
+    err.exhaustionType = "all_cooldown";
+    throw err;
+  }
   throw lastError || new Error("All accounts exhausted (rate-limited or disabled)");
 }
 
@@ -1475,8 +1490,9 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // API key authentication
-  if (!verifyApiKey(req)) {
+  // API key authentication (skip for health/models endpoints)
+  const rawPath = (req.url?.split("?")[0] ?? "/").replace(/^\/v1/, "");
+  if (!["/health", "/models", "/routing-status", "/accounts", "/stats"].includes(rawPath) && !verifyApiKey(req)) {
     return json(res, 401, { error: { message: "Invalid or missing API key", type: "authentication_error" } });
   }
 
@@ -1614,9 +1630,23 @@ async function handleRequest(req, res) {
       result = await runCodex(model, prompt, runOpts);
     } catch (err) {
       console.error(`[codex-gateway] codex error: ${err.message}`);
-      const statusCode = err.code === "ETIMEDOUT" ? 504 : isRateLimitError(err.message) ? 429 : 500;
-      const errorType =
-        statusCode === 504 ? "timeout_error" : statusCode === 429 ? "rate_limit_error" : "server_error";
+      let statusCode, errorType;
+      if (err.exhaustionType === "all_disabled") {
+        statusCode = 503;
+        errorType = "quota_exceeded";
+      } else if (err.exhaustionType === "all_cooldown") {
+        statusCode = 429;
+        errorType = "rate_limit_error";
+      } else if (err.code === "ETIMEDOUT") {
+        statusCode = 504;
+        errorType = "timeout_error";
+      } else if (isRateLimitError(err.message)) {
+        statusCode = 429;
+        errorType = "rate_limit_error";
+      } else {
+        statusCode = 500;
+        errorType = "server_error";
+      }
       return json(res, statusCode, { error: { message: err.message, type: errorType } });
     }
 
