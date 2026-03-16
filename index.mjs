@@ -68,7 +68,7 @@ const CODEX_EXEC_TIMEOUT_MS =
 const ACCOUNT_COOLDOWN_MS = parseInt(process.env.ACCOUNT_COOLDOWN_MS || "300000", 10); // 5 min default
 const ACCOUNT_SCAN_INTERVAL_MS = parseInt(process.env.ACCOUNT_SCAN_INTERVAL_MS || "60000", 10); // rescan every 60s
 const SELF_HEAL_INTERVAL_MS = 5 * 60 * 1000; // self-heal sweep every 5 min
-const DISABLED_RETRY_AFTER_MS = 30 * 60 * 1000; // retry refreshable disabled accounts after 30 min
+const DISABLED_RETRY_AFTER_MS = 5 * 60 * 1000; // retry refreshable disabled accounts after 5 min (OAuth refresh is free)
 
 // API key authentication (required when BIND_ADDR is not 127.0.0.1)
 const API_KEY = process.env.GATEWAY_API_KEY || "";
@@ -484,13 +484,90 @@ function markAccountDisabled(acct, reason, errorCategory) {
 }
 
 /**
- * Attempt to refresh/reprobe an account.
- * Step 1: Check if auth file has a newer token (external re-login).
- * Step 2: If opts.force, run a lightweight probe request.
+ * Refresh an account's OAuth2 token.
+ * Step 1: Try OAuth2 refresh_token grant (zero-cost, no API usage).
+ * Step 2: If OAuth fails, check if auth file was updated externally.
+ * Step 3: If opts.force, run a lightweight probe as last resort.
  */
+const OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+async function oauthRefreshToken(refreshToken) {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: OAUTH_CLIENT_ID,
+    refresh_token: refreshToken,
+  });
+  const resp = await fetch(OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => "");
+    let errMsg = `HTTP ${resp.status}`;
+    try {
+      const errJson = JSON.parse(errText);
+      errMsg = errJson.error_description || errJson.error || errMsg;
+    } catch {}
+    throw new Error(`oauth refresh failed: ${errMsg}`);
+  }
+  return resp.json();
+}
+
 async function refreshAccountRateLimits(acct, opts = {}) {
-  // Step 1: Re-read auth file to check if token was externally refreshed
   const authPath = acct.authFile;
+
+  // Step 1: OAuth2 refresh_token grant (preferred — zero cost)
+  if (authPath) {
+    try {
+      const raw = await fs.readFile(authPath, "utf-8");
+      const authData = JSON.parse(raw);
+      const oldRefreshToken = authData?.tokens?.refresh_token;
+
+      if (oldRefreshToken) {
+        console.log(`[codex-gateway] refresh: ${acct.label} attempting OAuth2 refresh...`);
+        const newTokens = await oauthRefreshToken(oldRefreshToken);
+
+        // Update auth file with new tokens (refresh token rotation)
+        authData.tokens.access_token = newTokens.access_token || authData.tokens.access_token;
+        if (newTokens.refresh_token) {
+          authData.tokens.refresh_token = newTokens.refresh_token;
+        }
+        if (newTokens.id_token) {
+          authData.tokens.id_token = newTokens.id_token;
+        }
+        authData.last_refresh = new Date().toISOString();
+        await fs.writeFile(authPath, JSON.stringify(authData, null, 2));
+
+        // Update in-memory account info from new JWT
+        const at = newTokens.access_token || authData.tokens.access_token;
+        const parts = at.split(".");
+        if (parts.length >= 2) {
+          const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+          if (acct.info) {
+            acct.info.token_expires = new Date((payload.exp || 0) * 1000).toISOString();
+            acct.info.plan = payload.plan || acct.info.plan;
+            acct.info.email = payload.email || acct.info.email;
+          }
+        }
+
+        // Also sync to account's isolated dir if it exists
+        const acctDir = path.join(ACCOUNTS_DIR, acct.label);
+        const acctAuth = path.join(acctDir, "auth.json");
+        try { await fs.copyFile(authPath, acctAuth); } catch {}
+
+        console.log(`[codex-gateway] refresh: ${acct.label} OAuth2 refresh succeeded, new expiry: ${acct.info?.token_expires}`);
+        return { refreshed: true, method: "oauth2_refresh" };
+      }
+    } catch (e) {
+      console.warn(`[codex-gateway] refresh: ${acct.label} OAuth2 refresh failed: ${e.message}`);
+      // Fall through to other methods
+    }
+  }
+
+  // Step 2: Check if auth file was updated externally (e.g., manual re-login)
   if (authPath) {
     try {
       const raw = await fs.readFile(authPath, "utf-8");
@@ -503,23 +580,20 @@ async function refreshAccountRateLimits(acct, opts = {}) {
           const newExpiry = new Date((payload.exp || 0) * 1000).toISOString();
           const oldExpiry = acct.info?.token_expires;
           if (newExpiry !== oldExpiry && new Date(newExpiry) > new Date()) {
-            // Token was refreshed externally
             if (acct.info) {
               acct.info.token_expires = newExpiry;
               acct.info.plan = payload.plan || acct.info?.plan;
               acct.info.email = payload.email || acct.info?.email;
             }
             console.log(`[codex-gateway] refresh: ${acct.label} token updated externally (new expiry: ${newExpiry})`);
-            return { refreshed: true, method: "token_update" };
+            return { refreshed: true, method: "external_update" };
           }
         }
       }
-    } catch (e) {
-      // Auth file read failed, continue to probe
-    }
+    } catch (e) {}
   }
 
-  // Step 2: Lightweight probe — run a cheap codex exec to verify account works
+  // Step 3: Lightweight probe (costs minimal tokens)
   if (opts.force) {
     const probeModel = "codex-mini-latest";
     console.log(`[codex-gateway] refresh: probing ${acct.label} with ${probeModel}...`);
@@ -532,7 +606,7 @@ async function refreshAccountRateLimits(acct, opts = {}) {
     return { refreshed: true, method: "probe_success" };
   }
 
-  throw new Error("No token update detected and probe not requested");
+  throw new Error("No refresh method succeeded");
 }
 
 function recordAccountUsage(acct, usage) {
@@ -1659,7 +1733,29 @@ async function handleRequest(req, res) {
   }
 
   // GET /accounts — dedicated account pool status
-  if (req.method === "GET" && route === "/accounts") {
+  // POST /refresh — trigger OAuth2 token refresh for all accounts
+  if (req.method === "POST" && route === "/refresh") {
+    if (!verifyApiKey(req)) return json(res, 401, { error: { message: "Invalid API key", type: "authentication_error" } });
+    const results = [];
+    for (const acct of accountPool) {
+      try {
+        const r = await refreshAccountRateLimits(acct, { force: false });
+        if (acct.disabled && r.refreshed) {
+          acct.disabled = false;
+          acct.disabledReason = null;
+          acct.disabledAt = null;
+          acct.errorCategory = null;
+          acct._reprobeAttempted = false;
+        }
+        results.push({ label: acct.label, status: "refreshed", method: r.method, new_expiry: acct.info?.token_expires });
+      } catch (e) {
+        results.push({ label: acct.label, status: "failed", error: e.message });
+      }
+    }
+    return json(res, 200, { results });
+  }
+
+    if (req.method === "GET" && route === "/accounts") {
     return json(res, 200, {
       total: accountPool.length,
       cooldown_ms: ACCOUNT_COOLDOWN_MS,
@@ -1790,6 +1886,23 @@ setInterval(async () => {
       warned++;
     }
 
+    // Proactive token refresh: refresh tokens expiring within 48h (OAuth2, zero cost)
+    if (!acct.disabled && acct.authFile) {
+      const expiry = getTokenExpiryWarning(acct);
+      if (expiry.warning_level === "warning_3d" || expiry.warning_level === "critical_24h") {
+        if (!acct._lastRefreshAttempt || (now - acct._lastRefreshAttempt) >= 60 * 60 * 1000) {
+          acct._lastRefreshAttempt = now;
+          try {
+            await refreshAccountRateLimits(acct, { force: false });
+            console.log(`[codex-gateway] self-heal: proactively refreshed ${acct.label} (was ${expiry.warning_level})`);
+            healed++;
+          } catch (e) {
+            // Not critical — will retry next sweep
+          }
+        }
+      }
+    }
+
     // Try to re-enable disabled accounts with refreshable errors after cool-off
     if (acct.disabled) {
       const category = acct.errorCategory || "unknown";
@@ -1808,7 +1921,7 @@ setInterval(async () => {
             healed++;
           } catch (e) {
             // Token not updated — try force probe every 2 hours
-            if (disabledAge >= 2 * 60 * 60 * 1000 && !acct._lastProbeAt || (now - (acct._lastProbeAt || 0)) >= 2 * 60 * 60 * 1000) {
+            if (disabledAge >= 30 * 60 * 1000 && (!acct._lastProbeAt || (now - (acct._lastProbeAt || 0)) >= 30 * 60 * 1000)) {
               acct._lastProbeAt = now;
               try {
                 await refreshAccountRateLimits(acct, { force: true });
