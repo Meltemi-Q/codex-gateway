@@ -67,6 +67,8 @@ const CODEX_EXEC_TIMEOUT_MS =
     : DEFAULT_CODEX_EXEC_TIMEOUT_MS;
 const ACCOUNT_COOLDOWN_MS = parseInt(process.env.ACCOUNT_COOLDOWN_MS || "300000", 10); // 5 min default
 const ACCOUNT_SCAN_INTERVAL_MS = parseInt(process.env.ACCOUNT_SCAN_INTERVAL_MS || "60000", 10); // rescan every 60s
+const SELF_HEAL_INTERVAL_MS = 5 * 60 * 1000; // self-heal sweep every 5 min
+const DISABLED_RETRY_AFTER_MS = 30 * 60 * 1000; // retry refreshable disabled accounts after 30 min
 
 // API key authentication (required when BIND_ADDR is not 127.0.0.1)
 const API_KEY = process.env.GATEWAY_API_KEY || "";
@@ -481,6 +483,58 @@ function markAccountDisabled(acct, reason, errorCategory) {
   );
 }
 
+/**
+ * Attempt to refresh/reprobe an account.
+ * Step 1: Check if auth file has a newer token (external re-login).
+ * Step 2: If opts.force, run a lightweight probe request.
+ */
+async function refreshAccountRateLimits(acct, opts = {}) {
+  // Step 1: Re-read auth file to check if token was externally refreshed
+  const authPath = acct.authFile;
+  if (authPath) {
+    try {
+      const raw = await fs.readFile(authPath, "utf-8");
+      const authData = JSON.parse(raw);
+      const token = authData?.tokens?.access_token;
+      if (token) {
+        const parts = token.split(".");
+        if (parts.length >= 2) {
+          const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+          const newExpiry = new Date((payload.exp || 0) * 1000).toISOString();
+          const oldExpiry = acct.info?.token_expires;
+          if (newExpiry !== oldExpiry && new Date(newExpiry) > new Date()) {
+            // Token was refreshed externally
+            if (acct.info) {
+              acct.info.token_expires = newExpiry;
+              acct.info.plan = payload.plan || acct.info?.plan;
+              acct.info.email = payload.email || acct.info?.email;
+            }
+            console.log(`[codex-gateway] refresh: ${acct.label} token updated externally (new expiry: ${newExpiry})`);
+            return { refreshed: true, method: "token_update" };
+          }
+        }
+      }
+    } catch (e) {
+      // Auth file read failed, continue to probe
+    }
+  }
+
+  // Step 2: Lightweight probe — run a cheap codex exec to verify account works
+  if (opts.force) {
+    const probeModel = "codex-mini-latest";
+    console.log(`[codex-gateway] refresh: probing ${acct.label} with ${probeModel}...`);
+    const result = await runCodexWithAccount(probeModel, "Reply OK", { max_tokens: 10, reasoning_effort: "low" }, acct);
+    if (result.rateLimited) throw new Error("probe: rate limited");
+    if (result.authFailed) throw new Error("probe: auth failed");
+    if (result.workspaceFailed) throw new Error("probe: workspace deactivated");
+    if (result.billingFailed) throw new Error("probe: billing failed");
+    console.log(`[codex-gateway] refresh: ${acct.label} probe succeeded`);
+    return { refreshed: true, method: "probe_success" };
+  }
+
+  throw new Error("No token update detected and probe not requested");
+}
+
 function recordAccountUsage(acct, usage) {
   if (!usage) return;
   ensureAccountStatsToday(acct);
@@ -672,10 +726,26 @@ async function archiveAndReset(newDay) {
   usageStats.by_model = {};
   usageStats.started_at = new Date().toISOString();
 
-  // Reset per-account stats too
+  // Reset per-account stats and attempt to recover disabled accounts
   for (const acct of accountPool) {
     acct.stats = freshAccountStats();
     acct.cooldownUntil = 0;
+
+    // Daily reset: give refreshable disabled accounts another chance
+    if (acct.disabled) {
+      const category = acct.errorCategory || "unknown";
+      const recoverability = errorRecoverability(category);
+      if (recoverability === "refreshable") {
+        acct.disabled = false;
+        acct.disabledReason = null;
+        acct.disabledAt = null;
+        acct.errorCategory = null;
+        acct._reprobeAttempted = false;
+        console.log(`[codex-gateway] daily-reset: re-enabled ${acct.label} (was disabled: ${category}, refreshable)`);
+      } else {
+        console.log(`[codex-gateway] daily-reset: ${acct.label} stays disabled (${category}, ${recoverability})`);
+      }
+    }
   }
 
   console.log(`[codex-gateway] stats reset for new day: ${newDay}`);
@@ -1700,6 +1770,78 @@ setInterval(async () => {
     console.warn(`[codex-gateway] periodic account scan failed: ${err.message}`);
   }
 }, ACCOUNT_SCAN_INTERVAL_MS);
+
+// ── Self-heal periodic sweep ──────────────────────────────────────────
+setInterval(async () => {
+  const now = Date.now();
+  let healed = 0, warned = 0;
+
+  for (const acct of accountPool) {
+    // Token expiry: auto-disable if expired, warn if critical
+    const expiry = getTokenExpiryWarning(acct);
+    if (expiry.warning_level === "expired" && !acct.disabled) {
+      markAccountDisabled(acct, "JWT token expired — re-login required", "auth_invalid");
+      console.warn(`[codex-gateway] self-heal: disabled ${acct.label} — token expired`);
+      warned++;
+      continue;
+    }
+    if (expiry.warning_level === "critical_24h") {
+      console.warn(`[codex-gateway] self-heal: ${acct.label} token expires in ${Math.ceil(expiry.expires_in_sec / 3600)}h — re-login soon!`);
+      warned++;
+    }
+
+    // Try to re-enable disabled accounts with refreshable errors after cool-off
+    if (acct.disabled) {
+      const category = acct.errorCategory || "unknown";
+      const recoverability = errorRecoverability(category);
+      if (recoverability === "refreshable" && acct.disabledAt) {
+        const disabledAge = now - new Date(acct.disabledAt).getTime();
+        if (disabledAge >= DISABLED_RETRY_AFTER_MS) {
+          try {
+            await refreshAccountRateLimits(acct, { force: false }); // check token file only
+            acct.disabled = false;
+            acct.disabledReason = null;
+            acct.disabledAt = null;
+            acct.errorCategory = null;
+            acct._reprobeAttempted = false;
+            console.log(`[codex-gateway] self-heal: re-enabled ${acct.label} after token refresh`);
+            healed++;
+          } catch (e) {
+            // Token not updated — try force probe every 2 hours
+            if (disabledAge >= 2 * 60 * 60 * 1000 && !acct._lastProbeAt || (now - (acct._lastProbeAt || 0)) >= 2 * 60 * 60 * 1000) {
+              acct._lastProbeAt = now;
+              try {
+                await refreshAccountRateLimits(acct, { force: true });
+                acct.disabled = false;
+                acct.disabledReason = null;
+                acct.disabledAt = null;
+                acct.errorCategory = null;
+                acct._reprobeAttempted = false;
+                console.log(`[codex-gateway] self-heal: re-enabled ${acct.label} after probe success`);
+                healed++;
+              } catch (probeErr) {
+                console.log(`[codex-gateway] self-heal: ${acct.label} probe failed: ${probeErr.message}`);
+              }
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    // Clear stale cooldowns and log
+    if (acct.cooldownUntil > 0 && acct.cooldownUntil <= now) {
+      console.log(`[codex-gateway] self-heal: ${acct.label} cooldown expired, back in rotation`);
+      acct.cooldownUntil = 0;
+      healed++;
+    }
+  }
+
+  if (healed > 0 || warned > 0) {
+    const available = accountPool.filter(a => !a.disabled).length;
+    console.log(`[codex-gateway] self-heal sweep: ${healed} healed, ${warned} warned, ${available}/${accountPool.length} accounts available`);
+  }
+}, SELF_HEAL_INTERVAL_MS);
 
 const server = http.createServer(async (req, res) => {
   try {
