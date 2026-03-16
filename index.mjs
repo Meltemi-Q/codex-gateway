@@ -1775,7 +1775,14 @@ async function handleRequest(req, res) {
     try { payload = await readBody(req); }
     catch { return json(res, 400, { error: { message: "Invalid JSON body", type: "invalid_request_error" } }); }
 
-    const model = payload.model || "gpt-5.4";
+    // Model alias mapping (for Droid which can't use real model names)
+    const MODEL_ALIASES = {
+      "cg-gpt54": "gpt-5.4",
+      "cg-gpt53": "gpt-5.3-codex",
+      "cg-gpt51": "gpt-5.1-codex",
+    };
+    const rawModel = payload.model || "gpt-5.4";
+    const model = MODEL_ALIASES[rawModel] || rawModel;
     const prompt = messagesToPrompt(payload.messages);
     const stream = Boolean(payload.stream);
     const includeUsage = Boolean(payload.stream_options?.include_usage);
