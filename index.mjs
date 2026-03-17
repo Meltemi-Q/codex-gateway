@@ -405,14 +405,16 @@ function pickNextAccount() {
 
   const now = Date.now();
 
-  // Try round-robin, skipping cooled-down and disabled accounts
-  for (let i = 0; i < available.length; i++) {
-    const idx = (roundRobinIndex + i) % available.length;
-    const acct = available[idx];
-    if (acct.cooldownUntil <= now) {
-      roundRobinIndex = (idx + 1) % available.length;
-      return acct;
-    }
+  // Pick account with lowest usage today (least tokens consumed)
+  const ready = available.filter(a => a.cooldownUntil <= now);
+
+  if (ready.length > 0) {
+    ready.sort((a, b) => {
+      const aTokens = (a.stats?.input_tokens || 0) + (a.stats?.output_tokens || 0);
+      const bTokens = (b.stats?.input_tokens || 0) + (b.stats?.output_tokens || 0);
+      return aTokens - bTokens;
+    });
+    return ready[0];
   }
 
   // All available accounts are on cooldown — pick the one that expires soonest
@@ -1636,12 +1638,57 @@ async function handleRequest(req, res) {
 
   // API key authentication (skip for health/models endpoints)
   const rawPath = (req.url?.split("?")[0] ?? "/").replace(/^\/v1/, "");
-  if (!["/health", "/models", "/routing-status", "/accounts", "/stats"].includes(rawPath) && !verifyApiKey(req)) {
+  if (!["/health", "/models", "/routing-status", "/accounts", "/stats", "/quota"].includes(rawPath) && !verifyApiKey(req)) {
     return json(res, 401, { error: { message: "Invalid or missing API key", type: "authentication_error" } });
   }
 
   const url = req.url?.split("?")[0] ?? "/";
   const route = url.startsWith("/v1") ? url.slice(3) : url;
+
+
+  // GET /quota — combined account quota with usage + token expiry countdown
+  if (req.method === "GET" && route === "/quota") {
+    const now = Date.now();
+    const result = {};
+    let bestLabel = null, bestRemaining = -1;
+    for (const acct of accountPool) {
+      ensureAccountStatsToday(acct);
+      const totalTokens = (acct.stats?.input_tokens || 0) + (acct.stats?.output_tokens || 0);
+      const pct = totalTokens / DAILY_TOKEN_BUDGET;
+      const remaining = 1.0 - pct;
+      let status = "available";
+      if (acct.disabled) status = "disabled";
+      else if (acct.cooldownUntil > now) status = "cooldown";
+      // Token expiry countdown
+      let expiryStr = null;
+      const expIso = acct.info?.token_expires;
+      if (expIso) {
+        const expMs = new Date(expIso).getTime() - now;
+        if (expMs <= 0) { expiryStr = "expired"; }
+        else {
+          const d = Math.floor(expMs / 86400000);
+          const h = Math.floor((expMs % 86400000) / 3600000);
+          expiryStr = expIso.slice(0, 10) + ` (in ${d}d${h}h)`;
+        }
+      }
+      result[acct.label] = {
+        status,
+        usage: (pct * 100).toFixed(1) + "%",
+        remaining: (remaining * 100).toFixed(1) + "%",
+        tokens_used: totalTokens,
+        budget: DAILY_TOKEN_BUDGET,
+        token_expires: expiryStr,
+      };
+      if (!acct.disabled && acct.cooldownUntil <= now && remaining > bestRemaining) {
+        bestRemaining = remaining;
+        bestLabel = acct.label;
+      }
+    }
+    const recommendation = bestLabel
+      ? `${bestLabel} (most remaining: ${(bestRemaining * 100).toFixed(0)}%)`
+      : "no accounts available";
+    return json(res, 200, { accounts: result, recommendation, daily_reset: "midnight UTC" });
+  }
 
   // GET /health — provider-level health for upstream consumers
   if (req.method === "GET" && route === "/health") {
@@ -1680,6 +1727,7 @@ async function handleRequest(req, res) {
         "POST /v1/auth-sync": "Manually trigger auth file sync to remote (requires AUTH_SYNC_TARGET)",
         "GET /v1/health": "Provider-level health (healthy/degraded/down) for upstream routing",
         "GET /v1/routing-status": "Eligible models and account routing state",
+        "GET /v1/quota": "Combined account quota with usage and token expiry",
         "GET /v1/help": "This help page",
       },
       request_parameters: {
